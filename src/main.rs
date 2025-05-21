@@ -761,6 +761,62 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
         "[{}] ✅ Chart processing complete. Saved to: {}",
         now, file_path
     );
+    
+    // Send notification to telegram service via ZMQ
+    if let Err(e) = send_telegram_notification(&data, &file_path) {
+        eprintln!("[{}] ❌ Failed to send telegram notification: {}", now, e);
+    } else {
+        println!("[{}] 📲 Telegram notification sent", now);
+    }
+}
+
+/// Send a notification to the telegram service via ZMQ with the chart details and image path
+fn send_telegram_notification(data: &ChartData, image_path: &str) -> Result<(), Box<dyn Error>> {
+    let context = zmq::Context::new();
+    let socket = context.socket(zmq::DEALER)?;
+    
+    // Connect to the same endpoint as the main application
+    let endpoint = "tcp://127.0.0.1:6565";
+    socket.connect(endpoint)?;
+    
+    // Extract timestamp from first data point if available
+    let timestamp_str = if let Some(first_point) = data.data.first() {
+        if !first_point.is_empty() {
+            let timestamp_millis = first_point[0] as i64;
+            let timestamp: DateTime<Utc> = Utc.timestamp_millis_opt(timestamp_millis).unwrap();
+            format!("{}", timestamp.format("%Y-%m-%d %H:%M:%S%z"))
+        } else {
+            "".to_string()
+        }
+    } else {
+        "".to_string()
+    };
+    
+    // Create the message text
+    let message_text = format!("{} - {} - {}\n{}", 
+        data.ticker, 
+        data.timeframe,
+        timestamp_str,
+        data.desc
+    );
+    
+    // Create the payload
+    let payload = serde_json::json!([
+        "ok",
+        "send_message",
+        {
+            "text": message_text,
+            "image_path": image_path
+        }
+    ]);
+    
+    // Convert to string
+    let json_message = payload.to_string();
+    
+    // Send the multipart message
+    socket.send_multipart(&[b"telegram", json_message.as_bytes()], 0)?;
+    
+    Ok(())
 }
 
 /// A small helper extension for converting a string hex code into a `ShapeStyle`.
