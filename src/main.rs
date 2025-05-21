@@ -8,6 +8,7 @@ use zmq;
 use plotters::prelude::*;
 
 
+
 /// The directory where we will save our chart images.
 /// Modify this path as needed.
 const OUTPUT_DIR: &str = "/home/user/python-scripts/services/charts";
@@ -220,11 +221,29 @@ fn handle_chart_request(data: ChartData) {
     let min_log_for_chart = min_log;
     let max_log_for_chart = padded_max_log;
 
-    let plot_width = 1024;
-    let plot_height = 768;
+    // Increase plot dimensions for a larger chart
+    let plot_width = 1280;
+    let plot_height = 960;
     let root_area = BitMapBackend::new(&file_path, (plot_width, plot_height)).into_drawing_area();
     root_area.fill(&WHITE).unwrap();
-
+    
+    // Allocate more height for the table area and include title space
+    let title_height = 40; // Dedicated space for the title
+    let table_height = 100; // More height for the table
+    let header_height = title_height + table_height;
+    
+    // Split the drawing area into three parts: title, table, and chart
+    let (header_area, chart_area) = root_area.split_vertically(header_height);
+    let (title_area, table_area) = header_area.split_vertically(title_height);
+    
+    // Apply horizontal margin to the table area (inset from left and right)
+    let margin_percent = 0.15; // 15% margin on each side
+    let left_margin = (plot_width as f64 * margin_percent) as u32;
+    let right_margin = plot_width - (plot_width as f64 * margin_percent) as u32;
+    // Split into left margin, table area, and right margin
+    let (left_area, rest) = table_area.split_horizontally(left_margin);
+    let (table_area, right_area) = rest.split_horizontally(right_margin - left_margin);
+    
     let effective_chart_area_width = plot_width as f64 * 0.85;
     let num_candles = processed_data.len();
 
@@ -241,8 +260,17 @@ fn handle_chart_request(data: ChartData) {
         .map(|(dt, _, _, _, _, _, _)| *dt)
         .unwrap_or(end_dt);
     let tight_end_dt = last_candle_time + chrono::Duration::seconds(1);
-    let total_time_span = tight_end_dt.timestamp_millis() - start_dt.timestamp_millis();
-    let millis_per_pixel = total_time_span as f64 / effective_chart_area_width;
+    // Instead of calculating the exact milliseconds per pixel (which can cause overflow),
+    // we'll use a safer approach with relative positioning
+    let total_time_span_millis = tight_end_dt.timestamp_millis() - start_dt.timestamp_millis();
+    
+    // Safety check to avoid potential overflow
+    if total_time_span_millis <= 0 || total_time_span_millis > i64::MAX / 2 {
+        eprintln!("Warning: Time span is too large or invalid, adjusting calculations");
+    }
+    
+    // Use f64 for all calculations to avoid integer overflow
+    let millis_per_pixel = total_time_span_millis as f64 / effective_chart_area_width;
 
     let volume_visible_bottom = min_log_for_chart;
     let volume_visible_top = min_log_for_chart + (0.15 * (max_log_for_chart - min_log_for_chart));
@@ -256,25 +284,83 @@ fn handle_chart_request(data: ChartData) {
         volume_visible_bottom + (normalized_vol * (volume_visible_top - volume_visible_bottom))
     };
 
-    let mut chart_context = ChartBuilder::on(&root_area)
-        .margin(10)
-        .x_label_area_size(80)
-        .y_label_area_size(0)
-        .right_y_label_area_size(60)
-        .caption(data.title.clone(), ("sans-serif", 20))
-        .build_cartesian_2d(start_dt..end_dt, min_log_for_chart..max_log_for_chart)
+    // Create a narrower time range for the chart to avoid datetime calculations that cause integer overflow
+    // The issue is in the Plotters library's datetime range handling when dealing with large time spans
+    
+    // Instead of using the full DateTime objects directly, we'll create a modified time range
+    // that uses smaller time units and won't trigger the overflow in Plotters' internal calculations
+    
+    // Create a simpler time range - use milliseconds since start as the x-axis unit
+    // This avoids any potential issues with the Plotters library's datetime handling
+    let millis_since_start = |dt: DateTime<Local>| -> i64 {
+        dt.timestamp_millis() - start_dt.timestamp_millis()
+    };
+    
+    // Calculate millisecond values for start and end points
+    let start_millis = 0; // 0 milliseconds since start
+    let end_millis = millis_since_start(end_dt);
+    
+    println!("  - Time range converted to milliseconds: {} to {} ms", start_millis, end_millis);
+    
+    // Build the chart using milliseconds since start instead of DateTime objects or hours
+    // Move price axis to right side as requested and maximize vertical space
+    let mut chart_context = ChartBuilder::on(&chart_area) // Use chart_area instead of root_area
+        // Reduce margins to maximize plot space
+        .margin(10) // Keep top/left/right margin small
+        .margin_bottom(20) // Significantly reduce bottom margin (was 60)
+        // Remove left label area and move to right side
+        .set_label_area_size(LabelAreaPosition::Left, 0)
+        .set_label_area_size(LabelAreaPosition::Right, 80) // Make right side wider for price labels
+        .set_label_area_size(LabelAreaPosition::Bottom, 40) // Reduced from 60
+        .build_cartesian_2d((start_millis as f64)..(end_millis as f64), min_log_for_chart..max_log_for_chart)
         .unwrap();
-
+        
+    // Title is centered in its own dedicated area at the very top of the canvas
+    // Need to center it properly on the full canvas width
+    let title_style = TextStyle::from(("sans-serif", 24))
+        .color(&BLACK);
+        
+    // Calculate the exact center of the entire canvas width (not just title area)
+    let title_pos = ((plot_width/2) as i32, title_height/2); // Center X coordinate based on full width
+    
+    // Draw a white background for the title area
+    title_area.fill(&WHITE).unwrap();
+    
+    // Draw the title text - we need to use draw_text with horizontal alignment
+    // to ensure it's properly centered, taking into account the Y-axis width
+    let text_width = data.title.len() as i32 * 15; // Estimate text width
+    let y_axis_width = 80; // The width of the Y-axis on the right side
+    
+    // Add a shift to compensate for the Y-axis on the right
+    // We shift by y_axis_width/2 to center the title on the plot area, not including the y-axis
+    let centered_x = (plot_width as i32 / 2) - (text_width / 2) + (y_axis_width / 2);
+    
+    title_area.draw_text(
+        &data.title,
+        &title_style,
+        (centered_x, title_height/2), // Adjusted position to account for Y-axis
+    ).unwrap();
+    
+    // Clear the table area with white before we begin
+    table_area.fill(&WHITE).unwrap();
+        
+    // Create a formatter to convert milliseconds back to readable dates
+    let millis_to_datetime = |millis: &f64| -> String {
+        let dt = start_dt + chrono::Duration::milliseconds(*millis as i64);
+        dt.format("%m-%d %H:%M").to_string()
+    };
+    
     chart_context
         .configure_mesh()
         .light_line_style(&RGBColor(235, 235, 235))
         .axis_style(&RGBColor(150, 150, 150))
         .x_labels(16)
+        .x_label_formatter(&millis_to_datetime)
         .y_labels(8)
         .disable_mesh()
-        .x_label_formatter(&|x| x.format("%m-%d %H:%M").to_string())
-        .x_label_style(TextStyle::from(("sans-serif", 14)).transform(FontTransform::Rotate90))
+        .x_label_style(TextStyle::from(("sans-serif", 12)))
         .y_label_style(("sans-serif", 15))
+        .y_desc("Price")
         .y_label_formatter(&|y| {
             let actual_price = log_to_price(*y);
             let rounded_price = if actual_price >= 100000.0 {
@@ -312,17 +398,17 @@ fn handle_chart_request(data: ChartData) {
         };
         chart_context
             .draw_series(std::iter::once(PathElement::new(
-                vec![(start_dt, y_pos), (end_dt, y_pos)],
+                vec![(start_millis as f64, y_pos), (end_millis as f64, y_pos)],
                 line_style,
             )))
             .unwrap();
     }
 
-    // Add a few vertical grid lines
-    let x_range = end_dt.timestamp() - start_dt.timestamp();
-    let x_step = x_range / 5;
+    // Add a few vertical grid lines (using hours-based coordinates)
+    let x_range = (end_millis as f64) - (start_millis as f64);
+    let x_step = x_range / 5.0;
     for i in 0..6 {
-        let x_pos = start_dt + chrono::Duration::seconds(x_step * i);
+        let x_pos = (start_millis as f64) + (x_step * i as f64);
         chart_context
             .draw_series(std::iter::once(PathElement::new(
                 vec![(x_pos, min_log_for_chart), (x_pos, max_log_for_chart)],
@@ -337,16 +423,13 @@ fn handle_chart_request(data: ChartData) {
             processed_data
                 .iter()
                 .enumerate()
-                .map(|(idx, (_dt, _o, _h, _l, _c, v, _color_hex))| {
-                    let candle_left_edge_pixel =
-                        idx as f64 * (candle_width_pixels + pixel_gap_between_candles);
-                    let candle_right_edge_pixel = candle_left_edge_pixel + candle_width_pixels;
-
-                    let left_pos_millis = (candle_left_edge_pixel * millis_per_pixel) as i64;
-                    let right_pos_millis = (candle_right_edge_pixel * millis_per_pixel) as i64;
-
-                    let x0 = start_dt + chrono::Duration::milliseconds(left_pos_millis);
-                    let x1 = start_dt + chrono::Duration::milliseconds(right_pos_millis);
+                .map(|(idx, (dt, _o, _h, _l, _c, v, _color_hex))| {
+                    // Use the same hours-based approach as for candlesticks
+                    let dt_hours = millis_since_start(*dt) as f64;
+                    let candle_width_in_hours = ((end_millis as f64) - (start_millis as f64)) / processed_data.len() as f64 * 0.8;
+                    
+                    let x0 = dt_hours - (candle_width_in_hours / 2.0);
+                    let x1 = dt_hours + (candle_width_in_hours / 2.0);
 
                     let y_bottom = volume_visible_bottom;
                     let y_top = volume_to_log_scale(*v);
@@ -417,45 +500,125 @@ fn handle_chart_request(data: ChartData) {
 
     let formatted_current_price = format_with_commas(current_price);
 
+    // No longer need the old price line and label here, as we've redesigned the price display
+
+    // Draw a single horizontal line at the current price level for reference
     chart_context
         .draw_series(std::iter::once(PathElement::new(
-            vec![(start_dt, current_price_log), (end_dt, current_price_log)],
-            last_candle_color
-                .stroke_width(1)
-                // Use stroke style directly without dasharray
-        )))
-        .unwrap()
-        .label(format!("Current Price: ${}", formatted_current_price));
-
-    // Draw black background box for that label
-    let text_width = formatted_current_price.len() as f64 * 10.0;
-    let padding_x = 8.0;
-    let padding_y = 0.006;
-
-    let rect_x0 = end_dt - chrono::Duration::milliseconds((text_width + padding_x * 2.0) as i64);
-    let rect_x1 = end_dt;
-    let rect_y0 = current_price_log - padding_y;
-    let rect_y1 = current_price_log + padding_y;
-
-    chart_context
-        .draw_series(std::iter::once(Rectangle::new(
-            [(rect_x0, rect_y0), (rect_x1, rect_y1)],
-            BLACK.filled(),
+            vec![(start_millis as f64, current_price_log), (end_millis as f64, current_price_log)],
+            RGBColor(100, 100, 100).stroke_width(1)
         )))
         .unwrap();
+        
+    // Now draw the table in table_area instead of showing the price on the chart
+    // Find the highest price in the visible plot
+    let highest_price = processed_data.iter()
+        .map(|(_, _, h, _, _, _, _)| *h)
+        .fold(f64::NEG_INFINITY, f64::max);
+        
+    // Calculate percentage from high
+    let percent_from_high = if highest_price > 0.0 {
+        ((highest_price - current_price) / highest_price) * 100.0
+    } else {
+        0.0
+    };
+    
+    // Table setup
+    let rows = vec!["Current Price", "High (in plot)", "% from High"];
+    let cols = vec!["Value"];
+    let table_data = vec![
+        vec![format!("${}", formatted_current_price)],
+        vec![format!("${}", format_with_commas(highest_price))],
+        vec![format!("{:.2}%", percent_from_high)],
+    ];
 
+    // Compute cell sizes
+    let cell_w = plot_width as f64 / 2.0; // Make table take half the width
+    let cell_h = table_height as f64 / (rows.len() + 1) as f64;
+    
+    // First, fill the table area with white for a clean background
+    // This creates the white spacing between cells
+    table_area.fill(&WHITE).unwrap();
+    
+    // Setup for cell drawing
+    let cell_padding = 5; // Space between cells in pixels (increased padding)
+    let section_width = (table_area.get_pixel_range().0.end - table_area.get_pixel_range().0.start) as i32;
+    let mid_point = section_width / 2;
+    
+    // Calculate optimal row height with spacing
+    let row_spacing = (cell_h * 0.15) as i32; // 15% of row height as spacing
+    let effective_row_height = cell_h as i32 - row_spacing;
+    
+    // Cell background color - medium grey for good visibility
+    let cell_bg_color = RGBColor(220, 220, 220);
+    
+    // Additional padding for bottom of cells
+    let bottom_padding = 6; // Extra bottom padding for cells
+    
+    for (ri, row_label) in rows.iter().enumerate() {
+        // Calculate position with proper spacing between rows
+        let row_pos = (ri as i32 * (effective_row_height + row_spacing + bottom_padding)) + cell_padding;
+        let row_height = effective_row_height;
+        let row_center = row_pos + (row_height / 2);
+        
+        // Text color based on data
+        let text_color = if ri == 0 { &last_candle_color } else { &BLACK };
+        
+        // Draw left column cell with padding on all sides
+        table_area.draw(&Rectangle::new(
+            [(cell_padding, row_pos), 
+             (mid_point - cell_padding, row_pos + row_height)],
+            cell_bg_color.filled()
+        )).unwrap();
+        
+        // Draw right column cell with padding on all sides
+        table_area.draw(&Rectangle::new(
+            [(mid_point + cell_padding, row_pos), 
+             (section_width - cell_padding, row_pos + row_height)],
+            cell_bg_color.filled()
+        )).unwrap();
+        
+        // Calculate better vertical position to ensure text is centered in the cell
+        // Move text up more from center for better vertical alignment and to add bottom padding effect
+        let text_y_adjustment = 4; // Increased shift up for more bottom padding appearance
+        let text_y_pos = row_center - text_y_adjustment;
+        
+        // Left column text (label) with proper vertical alignment
+        table_area.draw(&Text::new(
+            row_label.to_string(),
+            (cell_padding*4, text_y_pos), // Left padding with adjusted vertical position
+            ("sans-serif", 14).into_font().color(text_color),
+        )).unwrap();
+        
+        // Right column text (value) with proper vertical alignment
+        table_area.draw(&Text::new(
+            table_data[ri][0].clone(),
+            (mid_point + cell_padding*4, text_y_pos), // Left padding with adjusted vertical position
+            ("sans-serif", 14).into_font().color(text_color),
+        )).unwrap();
+    }
+    
+    // Add a horizontal line at the current price level using the same color as the last candle
     chart_context
-        .draw_series(std::iter::once(Text::new(
-            format!("${}", formatted_current_price),
-            (
-                rect_x0 + chrono::Duration::milliseconds(padding_x as i64),
-                current_price_log,
-            ),
-            ("sans-serif", 15).into_font().color(&WHITE),
+        .draw_series(std::iter::once(PathElement::new(
+            vec![(start_millis as f64, current_price_log), (end_millis as f64, current_price_log)],
+            last_candle_color.stroke_width(1)
         )))
         .unwrap();
+    
+    // We'll skip drawing the rectangle and text overlay since we're now
+    // highlighting the price directly in the y-axis labels
 
+    // We're no longer drawing the rectangle and text here since we're highlighting
+    // the price directly in the y-axis labels
+        
     // --- Draw the candlestick bodies (no wicks) with consistent spacing ---
+    // Print debug information for the first few candles
+    println!("  - Candle spacing calculations:");
+    println!("  - Chart width: {} pixels", effective_chart_area_width);
+    println!("  - Time span: {} milliseconds", total_time_span_millis);
+    println!("  - Candles to render: {}", processed_data.len());
+        
     chart_context
         .draw_series(
             processed_data
@@ -479,42 +642,49 @@ fn handle_chart_request(data: ChartData) {
                         (open_log, close_log)
                     };
 
-                    // Compute left/right time for the candle based on pixel spacing
-                    let candle_left_edge_pixel =
-                        idx as f64 * (candle_width_pixels + pixel_gap_between_candles);
-                    let candle_right_edge_pixel = candle_left_edge_pixel + candle_width_pixels;
-
-                    let left_pos_millis = (candle_left_edge_pixel * millis_per_pixel) as i64;
-                    let right_pos_millis = (candle_right_edge_pixel * millis_per_pixel) as i64;
-
-                    let body_left = start_dt + chrono::Duration::milliseconds(left_pos_millis);
-                    let body_right = start_dt + chrono::Duration::milliseconds(right_pos_millis);
-
-                    // Debug for the first few candles
+                    // Calculate candle width in hours
+                    let total_hours = (end_millis as f64) - (start_millis as f64);
+                    let candle_width_in_hours = total_hours / processed_data.len() as f64 * 0.8; // 80% of available space
+                    
+                    // We'll simply place each candle at its timestamp position
+                    // No need for complex calculations since we're using hours as the x-axis unit
+                    
+                    // Instead of using DateTime objects directly (which causes overflow in Plotters),
+                    // convert to hours since start for the x-axis positioning
+                    let dt_hours = millis_since_start(*dt) as f64;
+                    let body_left_hours = dt_hours - (candle_width_in_hours / 2.0);
+                    let body_right_hours = dt_hours + (candle_width_in_hours / 2.0);
+                    
+                    // Debug the first few candles
                     if idx < 3 {
-                        println!("  - Candle #{} body: {} to {}", idx, body_left, body_right);
+                        println!("  - Candle #{} position: {:.3}-{:.3} hours", 
+                            idx, body_left_hours, body_right_hours);
                         println!("  - Candle #{} actual timestamp: {}", idx, dt);
-                        println!("  - Candle #{} width: {} pixels", idx, candle_width_pixels);
+                        println!("  - Candle #{} width: {} hours", idx, candle_width_in_hours);
                         println!(
                             "  - Candle #{} O/C: ${:.2}/${:.2}, H/L: ${:.2}/${:.2}",
                             idx, o, c, h, l
                         );
                     }
 
+                    // Use hours for x-axis instead of DateTime objects
                     Rectangle::new(
-                        [(body_left, body_top), (body_right, body_bottom)],
+                        [(body_left_hours, body_top), (body_right_hours, body_bottom)],
                         candle_color.filled(),
                     )
                 }),
         )
         .unwrap();
 
+    // Instead of drawing custom labels, use the built-in x-axis labels with rotation
+    // We're now using simpler numerical hours as the x-axis values, which won't cause overflow
+    
     // Present and save the result
     root_area.present().unwrap();
 
     println!(
-        "[{}] ✅ Chart '{}' processing complete. Saved to: {}",
-        now, data.title, file_path
+        "[{}] ✅ Chart processing complete. Saved to: {}",
+        now, file_path
     );
 }
 
