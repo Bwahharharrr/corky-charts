@@ -1,17 +1,54 @@
 use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::from_str;
-use std::{error::Error, fs, str, thread};
+use std::{error::Error, fs, str, thread, path::PathBuf};
+use std::process::exit;
 use zmq;
 
 // Add plotters
 use plotters::prelude::*;
+use toml;
+use dirs;
 
+/// Configuration structure for the charts section of the config file
+#[derive(Debug, Deserialize)]
+struct ChartsConfig {
+    directory: Option<String>,
+}
 
+/// Overall configuration structure
+#[derive(Debug, Deserialize)]
+struct Config {
+    charts: Option<ChartsConfig>,
+}
 
-/// The directory where we will save our chart images.
-/// Modify this path as needed.
-const OUTPUT_DIR: &str = "/home/user/python-scripts/services/charts";
+/// Gets the output directory from the configuration file
+/// Returns an error if the directory is not specified in the config
+fn get_output_directory() -> Result<String, Box<dyn Error>> {
+    // Get the home directory using the dirs crate
+    let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
+    let config_path = home_dir.join(".corky").join("config.toml");
+    
+    // Check if the config file exists
+    if !config_path.exists() {
+        return Err("Config file ~/.corky/config.toml not found".into());
+    }
+    
+    // Read and parse the TOML file
+    let config_content = fs::read_to_string(config_path)?;
+    let config: Config = toml::from_str(&config_content)?;
+    
+    // Check if the charts section exists and has a directory
+    match config.charts {
+        Some(charts_config) => {
+            match charts_config.directory {
+                Some(dir) => Ok(dir),
+                None => Err("Output directory not specified in [charts] section of config.toml".into())
+            }
+        },
+        None => Err("[charts] section not found in config.toml".into())
+    }
+}
 
 // ─── Data Structures ────────────────────────────────────────────────────────────
 
@@ -46,6 +83,18 @@ pub struct Plots {
 // ─── Main Logic ─────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Get the output directory from config file
+    // If it fails, print the error message and exit
+    let output_dir = match get_output_directory() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("ERROR: {}", e);
+            exit(1);
+        }
+    };
+    
+    println!("[INIT] Using output directory: {}", output_dir);
+    
     let context = zmq::Context::new();
     let socket = context.socket(zmq::DEALER)?;
     socket.set_identity(b"rustcharts")?;
@@ -72,10 +121,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         );
                         log_data_summary(&req.2);
 
-                        // Spawn a thread for chart generation
+                        // Spawn a thread for chart generation and pass the output directory
                         let chart_data = req.2.clone();
+                        let output_dir_clone = output_dir.clone();
                         thread::spawn(move || {
-                            handle_chart_request(chart_data);
+                            handle_chart_request(chart_data, &output_dir_clone);
                         });
                     }
                     Err(e) => {
@@ -119,7 +169,7 @@ fn log_data_summary(data: &ChartData) {
 
 // ─── Actual Chart Handler with Plotters ─────────────────────────────────────────
 
-fn handle_chart_request(data: ChartData) {
+fn handle_chart_request(data: ChartData, output_dir: &str) {
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
     println!(
         "[{}] 🖼️  Processing chart: '{}' with {} candles",
@@ -134,11 +184,11 @@ fn handle_chart_request(data: ChartData) {
         return;
     }
 
-    // Ensure OUTPUT_DIR exists
-    fs::create_dir_all(OUTPUT_DIR).ok();
+    // Ensure output directory exists
+    fs::create_dir_all(output_dir).ok();
 
     // We'll build a file name using the ticker + timeframe + ".png"
-    let file_path = format!("{}/{}_{}.png", OUTPUT_DIR, data.ticker, data.timeframe);
+    let file_path = format!("{}/{}_{}.png", output_dir, data.ticker, data.timeframe);
 
     // --- 1) Parse Timestamps and OHLCV; find min & max for Y ---
     let mut min_price = f64::MAX;
