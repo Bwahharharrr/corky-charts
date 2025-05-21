@@ -619,6 +619,39 @@ fn handle_chart_request(data: ChartData) {
     println!("  - Time span: {} milliseconds", total_time_span_millis);
     println!("  - Candles to render: {}", processed_data.len());
         
+    // First draw the wicks (thin dark grey rectangles) so they appear behind the candle bodies
+    chart_context
+        .draw_series(
+            processed_data
+                .iter()
+                .enumerate()
+                .map(|(idx, (dt, _o, h, l, _c, _v, _color_hex))| {
+                    // Convert to milliseconds since start for x-axis positioning
+                    let dt_millis = millis_since_start(*dt) as f64;
+                    
+                    // Calculate candle and wick widths
+                    let total_millis = (end_millis as f64) - (start_millis as f64);
+                    let candle_width = total_millis / processed_data.len() as f64 * 0.8; // 80% of available space
+                    let wick_width = candle_width * 0.15; // 15% of candle width for the wick
+                    
+                    // Calculate wick position (center of the candle)
+                    let wick_left = dt_millis - (wick_width / 2.0);
+                    let wick_right = dt_millis + (wick_width / 2.0);
+                    
+                    // Convert high and low to log scale for plotting
+                    let high_log = h.ln();
+                    let low_log = l.ln();
+                    
+                    // Return a dark grey rectangle for the wick
+                    Rectangle::new(
+                        [(wick_left, high_log), (wick_right, low_log)],
+                        RGBColor(70, 70, 70).filled()
+                    )
+                })
+        )
+        .unwrap();
+    
+    // Next draw the candle bodies on top of the wicks
     chart_context
         .draw_series(
             processed_data
@@ -636,48 +669,40 @@ fn handle_chart_request(data: ChartData) {
                     let b = (rgb & 0xFF) as u8;
                     let candle_color = RGBColor(r, g, b);
 
+                    // Determine candle body top and bottom (based on open/close)
                     let (body_top, body_bottom) = if open_log <= close_log {
                         (close_log, open_log)
                     } else {
                         (open_log, close_log)
                     };
 
-                    // Calculate candle width in hours
-                    let total_hours = (end_millis as f64) - (start_millis as f64);
-                    let candle_width_in_hours = total_hours / processed_data.len() as f64 * 0.8; // 80% of available space
-                    
-                    // We'll simply place each candle at its timestamp position
-                    // No need for complex calculations since we're using hours as the x-axis unit
-                    
-                    // Instead of using DateTime objects directly (which causes overflow in Plotters),
-                    // convert to hours since start for the x-axis positioning
-                    let dt_hours = millis_since_start(*dt) as f64;
-                    let body_left_hours = dt_hours - (candle_width_in_hours / 2.0);
-                    let body_right_hours = dt_hours + (candle_width_in_hours / 2.0);
+                    // Calculate candle width and position
+                    let total_millis = (end_millis as f64) - (start_millis as f64);
+                    let candle_width = total_millis / processed_data.len() as f64 * 0.8; // 80% of available space
+                    let dt_millis = millis_since_start(*dt) as f64;
+                    let body_left = dt_millis - (candle_width / 2.0);
+                    let body_right = dt_millis + (candle_width / 2.0);
                     
                     // Debug the first few candles
                     if idx < 3 {
-                        println!("  - Candle #{} position: {:.3}-{:.3} hours", 
-                            idx, body_left_hours, body_right_hours);
+                        println!("  - Candle #{} position: {:.3}-{:.3} millis", 
+                            idx, body_left, body_right);
                         println!("  - Candle #{} actual timestamp: {}", idx, dt);
-                        println!("  - Candle #{} width: {} hours", idx, candle_width_in_hours);
-                        println!(
-                            "  - Candle #{} O/C: ${:.2}/${:.2}, H/L: ${:.2}/${:.2}",
-                            idx, o, c, h, l
-                        );
+                        println!("  - Candle #{} high/low: ${:.2}/${:.2}", idx, h, l);
+                        println!("  - Candle #{} open/close: ${:.2}/${:.2}", idx, o, c);
                     }
-
-                    // Use hours for x-axis instead of DateTime objects
+                    
+                    // Return the rectangle for the candle body
                     Rectangle::new(
-                        [(body_left_hours, body_top), (body_right_hours, body_bottom)],
-                        candle_color.filled(),
+                        [(body_left, body_top), (body_right, body_bottom)],
+                        candle_color.filled()
                     )
-                }),
+                })
         )
         .unwrap();
 
-    // Instead of drawing custom labels, use the built-in x-axis labels with rotation
-    // We're now using simpler numerical hours as the x-axis values, which won't cause overflow
+// Instead of drawing custom labels, use the built-in x-axis labels with rotation
+// We're now using simpler numerical hours as the x-axis values, which won't cause overflow
     
     // Present and save the result
     root_area.present().unwrap();
