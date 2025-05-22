@@ -3,6 +3,21 @@ name = "corky-charts"
 version = "0.1.0"
 edition = "2024"
 
+[banner]
+ascii = """
+    /\\
+   /  \\
+  /    \\__
+_/        \\
+           \\__
+  Corky Charts
+"""
+
+
+[corky]
+is_corky_package = true
+
+
 [dependencies]
 zmq = "0.10"
 chrono = "0.4.26"

@@ -1,0 +1,4 @@
+[charts]
+
+# Output directory for chart images
+directory = "/tmp"
