@@ -73,6 +73,12 @@ pub struct ChartData {
     pub candle_colors: Vec<String>,
     pub plots: Plots,
     pub desc: String,
+    /// Optional chat ID for telegram message
+    #[serde(default)]
+    pub chat_id: Option<i64>,
+    /// Optional subscriber list name for telegram message
+    #[serde(default)]
+    pub subscriber_list: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -766,7 +772,13 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
     if let Err(e) = send_telegram_notification(&data, &file_path) {
         eprintln!("[{}] ❌ Failed to send telegram notification: {}", now, e);
     } else {
-        println!("[{}] 📲 Telegram notification sent", now);
+        // Log where the notification was sent
+        let destination = match (&data.chat_id, &data.subscriber_list) {
+            (Some(chat_id), _) => format!("chat_id: {}", chat_id),
+            (_, Some(list)) => format!("subscriber_list: {}", list),
+            _ => "default destination".to_string()
+        };
+        println!("[{}] 📲 Telegram notification sent to {}", now, destination);
     }
 }
 
@@ -800,13 +812,15 @@ fn send_telegram_notification(data: &ChartData, image_path: &str) -> Result<(), 
         data.desc
     );
     
-    // Create the payload
+    // Create the payload with chat_id and subscriber_list if available
     let payload = serde_json::json!([
         "ok",
         "send_message",
         {
             "text": message_text,
-            "image_path": image_path
+            "image_path": image_path,
+            "chat_id": data.chat_id,
+            "subscriber_list": data.subscriber_list
         }
     ]);
     
