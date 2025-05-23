@@ -1,12 +1,14 @@
 use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::from_str;
-use std::{error::Error, fs, str, thread, path::PathBuf};
+use std::{error::Error, fs, str, thread};
 use std::process::exit;
 use zmq;
+use colored::*;
 
 // Add plotters
 use plotters::prelude::*;
+use plotters::style::Color;
 use toml;
 use dirs;
 
@@ -99,16 +101,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     
-    println!("[INIT] Using output directory: {}", output_dir);
+    println!("{} {}", "[INIT]".blue().bold(), format!("Using output directory: {}", output_dir).white());
     
     let context = zmq::Context::new();
     let socket = context.socket(zmq::DEALER)?;
     socket.set_identity(b"rustcharts")?;
     let endpoint = "tcp://127.0.0.1:6565";
-    println!("[INIT] Connecting to {} as 'rustcharts'…", endpoint);
+    println!("{} {}", "[INIT]".blue().bold(), format!("Connecting to {} as 'rustcharts'…", endpoint).white());
     socket.connect(endpoint)?;
 
-    println!("[READY] Awaiting incoming chart messages…");
+    println!("{} {}", "[READY]".green().bold(), "Awaiting incoming chart messages…".white());
 
     loop {
         let frames = socket.recv_multipart(0)?;
@@ -118,12 +120,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             Some(json_str) => {
                 match from_str::<ChartRequest>(json_str) {
                     Ok(req) => {
+                        // Add a yellow separator line before each new chart request
+                        println!("{} {}", 
+                            "╔".yellow(), 
+                            "══════════════════════════════════════════════════════════════════════".yellow()
+                        );
+                        
                         println!(
-                            "[{}] ▶ New Chart Request for {} @ {} [{} candles]",
-                            now,
-                            req.2.ticker,
-                            req.2.timeframe,
-                            req.2.data.len()
+                            "{} {} {}",
+                            format!("[{}]", now).dimmed(),
+                            "▶".cyan().bold(),
+                            format!("New Chart Request for {} @ {} [{} candles]", 
+                                req.2.ticker.bold().yellow(), 
+                                req.2.timeframe.bold(), 
+                                req.2.data.len().to_string().bold().green()
+                            )
                         );
                         log_data_summary(&req.2);
 
@@ -165,8 +176,6 @@ fn log_data_summary(data: &ChartData) {
             start_dt.format("%Y-%m-%d %H:%M:%S"),
             end_dt.format("%Y-%m-%d %H:%M:%S"),
         );
-        println!("       Columns: {:?}", data.cols);
-        println!("       Title: {}", data.title);
         println!("       Desc: {}", data.desc);
     } else {
         println!("       No candle data available.");
@@ -283,6 +292,26 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
     let root_area = BitMapBackend::new(&file_path, (plot_width, plot_height)).into_drawing_area();
     root_area.fill(&WHITE).unwrap();
     
+    // Log price range in a clean format
+    let format_with_commas = |price: f64| -> String {
+        let price_int = price.round() as i64;
+        format!("{}", price_int)
+            .as_bytes()
+            .rchunks(3)
+            .rev()
+            .map(std::str::from_utf8)
+            .collect::<Result<Vec<&str>, _>>()
+            .unwrap()
+            .join(",")
+    };
+    
+    println!(
+        "{} ${} - ${}",
+        "Price range:".dimmed(),
+        format_with_commas(lowest_price).bold().green(),
+        format_with_commas(highest_price).bold().green()
+    );
+    
     // Allocate more height for the table area and include title space
     let title_height = 40; // Dedicated space for the title
     let table_height = 100; // More height for the table
@@ -356,7 +385,15 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
     let start_millis = 0; // 0 milliseconds since start
     let end_millis = millis_since_start(end_dt);
     
-    println!("  - Time range converted to milliseconds: {} to {} ms", start_millis, end_millis);
+    // Calculate the duration of one candle in milliseconds
+    let total_candles = processed_data.len() as f64;
+    let candle_duration_ms = (end_millis - start_millis) as f64 / total_candles;
+    
+    // Add 3 candles worth of space to the end
+    let padded_end_millis = end_millis as f64 + (candle_duration_ms * 3.0);
+    
+    println!("  - Time range converted to milliseconds: {} to {} ms (with padding: {} ms)", 
+        start_millis, end_millis, padded_end_millis);
     
     // Build the chart using milliseconds since start instead of DateTime objects or hours
     // Move price axis to right side as requested and maximize vertical space
@@ -368,7 +405,7 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
         .set_label_area_size(LabelAreaPosition::Left, 0)
         .set_label_area_size(LabelAreaPosition::Right, 80) // Make right side wider for price labels
         .set_label_area_size(LabelAreaPosition::Bottom, 40) // Reduced from 60
-        .build_cartesian_2d((start_millis as f64)..(end_millis as f64), min_log_for_chart..max_log_for_chart)
+        .build_cartesian_2d((start_millis as f64)..padded_end_millis, min_log_for_chart..max_log_for_chart)
         .unwrap();
         
     // Title is centered in its own dedicated area at the very top of the canvas
@@ -502,41 +539,7 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
     // Sort data by timestamp to ensure correct order for candle drawing
     processed_data.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Log some details
-    let format_with_commas = |price: f64| -> String {
-        let price_int = price.round() as i64;
-        format!("{}", price_int)
-            .as_bytes()
-            .rchunks(3)
-            .rev()
-            .map(std::str::from_utf8)
-            .collect::<Result<Vec<&str>, _>>()
-            .unwrap()
-            .join(",")
-    };
-
-    println!(
-        "Price range: ${} - ${}",
-        format_with_commas(lowest_price),
-        format_with_commas(highest_price)
-    );
-    println!("Log price range: {:.2} - {:.2}", log_lowest, log_highest);
-    println!("Candle rendering details:");
-    println!("  - Number of candles: {}", num_candles);
-    println!("  - Fitting space for {} candles (no extra space)", candles_to_fit);
-    println!(
-        "  - Available chart width: {:.1} pixels",
-        effective_chart_area_width
-    );
-    println!("  - Candle width: {:.1} pixels", candle_width_pixels);
-    println!(
-        "  - Gap between candles: {:.0} pixels (fixed)",
-        pixel_gap_between_candles
-    );
-    println!(
-        "  - Log price range: {:.2} - {:.2} (Y-axis shows these log values)",
-        log_lowest, log_highest
-    );
+    // Format price with commas for better readability is now done earlier in the code
 
     // --- Draw the dotted line for current price on the last candle ---
     let last_candle = processed_data.last().cloned();
@@ -669,11 +672,7 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
     // the price directly in the y-axis labels
         
     // --- Draw the candlestick bodies (no wicks) with consistent spacing ---
-    // Print debug information for the first few candles
-    println!("  - Candle spacing calculations:");
-    println!("  - Chart width: {} pixels", effective_chart_area_width);
-    println!("  - Time span: {} milliseconds", total_time_span_millis);
-    println!("  - Candles to render: {}", processed_data.len());
+    // Debug information removed for cleaner output
         
     // First draw the wicks (thin dark grey rectangles) so they appear behind the candle bodies
     chart_context
@@ -739,14 +738,7 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
                     let body_left = dt_millis - (candle_width / 2.0);
                     let body_right = dt_millis + (candle_width / 2.0);
                     
-                    // Debug the first few candles
-                    if idx < 3 {
-                        println!("  - Candle #{} position: {:.3}-{:.3} millis", 
-                            idx, body_left, body_right);
-                        println!("  - Candle #{} actual timestamp: {}", idx, dt);
-                        println!("  - Candle #{} high/low: ${:.2}/${:.2}", idx, h, l);
-                        println!("  - Candle #{} open/close: ${:.2}/${:.2}", idx, o, c);
-                    }
+                    // Debug output removed for cleaner logs
                     
                     // Return the rectangle for the candle body
                     Rectangle::new(
@@ -764,8 +756,10 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
     root_area.present().unwrap();
 
     println!(
-        "[{}] ✅ Chart processing complete. Saved to: {}",
-        now, file_path
+        "{} {} {}",
+        format!("[{}]", now).dimmed(),
+        "✅".green().bold(),
+        format!("Chart processing complete. Saved to: {}", file_path.bold())
     );
     
     // Send notification to telegram service via ZMQ
@@ -778,7 +772,12 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
             (_, Some(list)) => format!("subscriber_list: {}", list),
             _ => "default destination".to_string()
         };
-        println!("[{}] 📲 Telegram notification sent to {}", now, destination);
+        println!(
+            "{} {} {}",
+            format!("[{}]", now).dimmed(),
+            "📲".blue().bold(),
+            format!("Telegram notification sent to {}", destination.bold())
+        );
     }
 }
 
@@ -791,33 +790,12 @@ fn send_telegram_notification(data: &ChartData, image_path: &str) -> Result<(), 
     let endpoint = "tcp://127.0.0.1:6565";
     socket.connect(endpoint)?;
     
-    // Extract timestamp from first data point if available
-    let timestamp_str = if let Some(first_point) = data.data.first() {
-        if !first_point.is_empty() {
-            let timestamp_millis = first_point[0] as i64;
-            let timestamp: DateTime<Utc> = Utc.timestamp_millis_opt(timestamp_millis).unwrap();
-            format!("{}", timestamp.format("%Y-%m-%d %H:%M:%S%z"))
-        } else {
-            "".to_string()
-        }
-    } else {
-        "".to_string()
-    };
-    
-    // Create the message text
-    let message_text = format!("{} - {} - {}\n{}", 
-        data.ticker, 
-        data.timeframe,
-        timestamp_str,
-        data.desc
-    );
-    
     // Create the payload with chat_id and subscriber_list if available
     let payload = serde_json::json!([
         "ok",
         "send_message",
         {
-            "text": message_text,
+            "text": data.desc,
             "image_path": image_path,
             "chat_id": data.chat_id,
             "subscriber_list": data.subscriber_list
