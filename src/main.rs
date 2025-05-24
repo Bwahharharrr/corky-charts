@@ -8,9 +8,7 @@ use colored::*;
 
 // Add plotters
 use plotters::prelude::*;
-use plotters::style::Color;
-use toml;
-use dirs;
+use plotters::style::{RGBColor, TextStyle, Color, IntoFont};
 
 /// Configuration structure for the charts section of the config file
 #[derive(Debug, Deserialize)]
@@ -61,6 +59,21 @@ pub struct ChartRequest(
     #[serde(rename = "2")] pub ChartData,
 );
 
+fn parse_hex_color(hex: &str) -> RGBColor {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() == 6 {
+        if let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&hex[0..2], 16),
+            u8::from_str_radix(&hex[2..4], 16),
+            u8::from_str_radix(&hex[4..6], 16),
+        ) {
+            return RGBColor(r, g, b);
+        }
+    }
+    // Default to gray if parsing fails
+    RGBColor(128, 128, 128)
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ChartData {
     pub title: String,
@@ -73,6 +86,9 @@ pub struct ChartData {
     pub data: Vec<Vec<f64>>,
     /// Colors for each candle, e.g. `["#FF0000", "#00FF00", ...]`
     pub candle_colors: Vec<String>,
+    /// Optional colors for each volume bar, e.g. `["#FF0000", "#00FF00", ...]`
+    #[serde(default)]
+    pub volume_colors: Option<Vec<String>>,
     pub plots: Plots,
     pub desc: String,
     /// Optional chat ID for telegram message
@@ -527,7 +543,13 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
                     let y_bottom = volume_visible_bottom;
                     let y_top = volume_to_log_scale(*v);
 
-                    let volume_color = RGBColor(130, 130, 130);
+                    // Use volume color if available, otherwise default to gray
+                    let volume_color = data.volume_colors
+                        .as_ref()
+                        .and_then(|colors| colors.get(idx).cloned())
+                        .map(|color| parse_hex_color(&color))
+                        .unwrap_or_else(|| RGBColor(130, 130, 130));
+
                     Rectangle::new(
                         [(x0, y_bottom), (x1, y_top)],
                         volume_color.mix(0.8).filled(),
