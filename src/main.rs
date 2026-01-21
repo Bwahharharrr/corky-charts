@@ -99,9 +99,31 @@ pub struct ChartData {
     pub subscriber_list: Option<String>,
 }
 
+/// Marker to be drawn on the chart (e.g., signal indicators)
+#[derive(Debug, Deserialize, Clone)]
+pub struct Mark {
+    /// Timestamp in milliseconds (candle timestamp)
+    pub time: i64,
+    /// "above" or "below" the candle
+    pub position: String,
+    /// Hex color "#RRGGBB"
+    pub color: String,
+    /// Optional label text (e.g., "4h")
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Relative size (default 1.0)
+    #[serde(default = "default_mark_size")]
+    pub size: f64,
+}
+
+fn default_mark_size() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Plots {
-    pub marks: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub marks: Vec<Mark>,
 }
 
 // ─── Main Logic ─────────────────────────────────────────────────────────────────
@@ -771,9 +793,92 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
         )
         .unwrap();
 
+    // --- Draw markers from plots.marks ---
+    let candle_duration_millis = if processed_data.len() > 1 {
+        let total_millis = (end_millis as f64) - (start_millis as f64);
+        total_millis / processed_data.len() as f64
+    } else {
+        60000.0 // Default 1 minute if only one candle
+    };
+    let marker_candle_width = candle_duration_millis * 0.8;
+
+    for mark in &data.plots.marks {
+        // Convert mark timestamp to milliseconds since chart start
+        let mark_time_millis = mark.time - start_dt.timestamp_millis();
+        let x = mark_time_millis as f64;
+
+        // Find candle at this timestamp to get high/low for positioning
+        // Allow small tolerance for timestamp matching (within half a candle duration)
+        let candle_idx = processed_data.iter().position(|(dt, _, _, _, _, _, _)| {
+            let dt_millis = millis_since_start(*dt);
+            (dt_millis - mark_time_millis).abs() < (candle_duration_millis as i64 / 2)
+        });
+
+        if let Some(idx) = candle_idx {
+            let (_, _, h, l, _, _, _) = &processed_data[idx];
+            let size = mark.size;
+            let log_range = max_log_for_chart - min_log_for_chart;
+            let offset = log_range * 0.02 * size; // 2% of price range per size unit
+
+            let y = if mark.position == "above" {
+                h.ln() + offset
+            } else {
+                l.ln() - offset
+            };
+
+            let color = parse_hex_color(&mark.color);
+            let triangle_half_width = marker_candle_width / 3.0 * size;
+            let triangle_height = offset / 2.0;
+
+            // Draw triangle marker
+            if mark.position == "above" {
+                // Downward-pointing triangle (▼) above candle, pointing at the high
+                chart_context
+                    .draw_series(std::iter::once(Polygon::new(
+                        vec![
+                            (x, y - triangle_height),           // Bottom point (pointing down)
+                            (x - triangle_half_width, y + triangle_height), // Top left
+                            (x + triangle_half_width, y + triangle_height), // Top right
+                        ],
+                        color.filled(),
+                    )))
+                    .unwrap();
+            } else {
+                // Upward-pointing triangle (▲) below candle, pointing at the low
+                chart_context
+                    .draw_series(std::iter::once(Polygon::new(
+                        vec![
+                            (x, y + triangle_height),           // Top point (pointing up)
+                            (x - triangle_half_width, y - triangle_height), // Bottom left
+                            (x + triangle_half_width, y - triangle_height), // Bottom right
+                        ],
+                        color.filled(),
+                    )))
+                    .unwrap();
+            }
+
+            // Draw label text if provided
+            if let Some(text) = &mark.text {
+                let text_y = if mark.position == "above" {
+                    y + offset * 1.2
+                } else {
+                    y - offset * 1.2
+                };
+                let font_size = (12.0 * size).max(8.0) as i32;
+                chart_context
+                    .draw_series(std::iter::once(Text::new(
+                        text.clone(),
+                        (x, text_y),
+                        TextStyle::from(("sans-serif", font_size)).color(&color),
+                    )))
+                    .unwrap();
+            }
+        }
+    }
+
 // Instead of drawing custom labels, use the built-in x-axis labels with rotation
 // We're now using simpler numerical hours as the x-axis values, which won't cause overflow
-    
+
     // Present and save the result
     root_area.present().unwrap();
 
