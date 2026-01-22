@@ -97,6 +97,9 @@ pub struct ChartData {
     /// Optional subscriber list name for telegram message
     #[serde(default)]
     pub subscriber_list: Option<String>,
+    /// Optional unique image filename to prevent race condition overwrites
+    #[serde(default)]
+    pub image_filename: Option<String>,
 }
 
 /// Marker to be drawn on the chart (e.g., signal indicators)
@@ -240,8 +243,11 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
     // Ensure output directory exists
     fs::create_dir_all(output_dir).ok();
 
-    // We'll build a file name using the ticker + timeframe + ".png"
-    let file_path = format!("{}/{}_{}.png", output_dir, data.ticker, data.timeframe);
+    // Use image_filename if provided (unique per alert), otherwise fall back to ticker_timeframe
+    let file_path = match &data.image_filename {
+        Some(filename) => format!("{}/{}", output_dir, filename),
+        None => format!("{}/{}_{}.png", output_dir, data.ticker, data.timeframe),
+    };
 
     // --- 1) Parse Timestamps and OHLCV; find min & max for Y ---
     let mut min_price = f64::MAX;
