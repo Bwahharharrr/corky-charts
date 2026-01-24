@@ -8,7 +8,7 @@ use colored::*;
 
 // Add plotters
 use plotters::prelude::*;
-use plotters::style::{RGBColor, TextStyle, Color, IntoFont};
+use plotters::style::{RGBColor, RGBAColor, TextStyle, Color, IntoFont};
 
 /// Configuration structure for the charts section of the config file
 #[derive(Debug, Deserialize)]
@@ -74,6 +74,33 @@ fn parse_hex_color(hex: &str) -> RGBColor {
     RGBColor(128, 128, 128)
 }
 
+/// Parse hex color with alpha channel support (e.g., "#FF000020")
+fn parse_hex_color_with_alpha(hex: &str) -> RGBAColor {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() == 8 {
+        // #RRGGBBAA format
+        if let (Ok(r), Ok(g), Ok(b), Ok(a)) = (
+            u8::from_str_radix(&hex[0..2], 16),
+            u8::from_str_radix(&hex[2..4], 16),
+            u8::from_str_radix(&hex[4..6], 16),
+            u8::from_str_radix(&hex[6..8], 16),
+        ) {
+            return RGBAColor(r, g, b, a as f64 / 255.0);
+        }
+    } else if hex.len() == 6 {
+        // #RRGGBB format - default 30% opacity
+        if let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&hex[0..2], 16),
+            u8::from_str_radix(&hex[2..4], 16),
+            u8::from_str_radix(&hex[4..6], 16),
+        ) {
+            return RGBAColor(r, g, b, 0.3);
+        }
+    }
+    // Default to semi-transparent gray if parsing fails
+    RGBAColor(128, 128, 128, 0.3)
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ChartData {
     pub title: String,
@@ -123,10 +150,27 @@ fn default_mark_size() -> f64 {
     1.0
 }
 
+/// Rectangular zone for resistance/support visualization
+#[derive(Debug, Deserialize, Clone)]
+pub struct Zone {
+    /// Left timestamp (ms) - when signal was confirmed
+    pub x1: i64,
+    /// Right timestamp (ms) - last candle timestamp
+    pub x2: i64,
+    /// Bottom price
+    pub y1: f64,
+    /// Top price
+    pub y2: f64,
+    /// Hex color with alpha "#RRGGBBAA"
+    pub color: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Plots {
     #[serde(default)]
     pub marks: Vec<Mark>,
+    #[serde(default)]
+    pub zones: Vec<Zone>,
 }
 
 // ─── Main Logic ─────────────────────────────────────────────────────────────────
@@ -552,6 +596,27 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
                 RGBColor(245, 245, 245).stroke_width(1),
             )))
             .unwrap();
+    }
+
+    // --- Draw zones (semi-transparent rectangles behind everything) ---
+    for zone in &data.plots.zones {
+        // Convert zone timestamps to milliseconds since chart start
+        let x1 = (zone.x1 - start_dt.timestamp_millis()) as f64;
+        let x2 = (zone.x2 - start_dt.timestamp_millis()) as f64;
+
+        // Convert prices to log scale (matching chart's y-axis)
+        let y1_log = zone.y1.max(1e-12).ln();
+        let y2_log = zone.y2.max(1e-12).ln();
+
+        // Parse color with alpha
+        let color = parse_hex_color_with_alpha(&zone.color);
+
+        chart_context
+            .draw_series(std::iter::once(Rectangle::new(
+                [(x1, y1_log), (x2, y2_log)],
+                color.filled(),
+            )))
+            .ok();
     }
 
     // --- Volume bars (draw behind candles) ---
