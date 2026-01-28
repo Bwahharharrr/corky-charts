@@ -165,12 +165,23 @@ pub struct Zone {
     pub color: String,
 }
 
+/// Vertical line for marking specific timestamps (e.g., alert fire points)
+#[derive(Debug, Deserialize, Clone)]
+pub struct VLine {
+    /// Timestamp in milliseconds
+    pub time: i64,
+    /// Hex color "#RRGGBB" or "#RRGGBBAA"
+    pub color: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Plots {
     #[serde(default)]
     pub marks: Vec<Mark>,
     #[serde(default)]
     pub zones: Vec<Zone>,
+    #[serde(default)]
+    pub vlines: Vec<VLine>,
 }
 
 // ─── Main Logic ─────────────────────────────────────────────────────────────────
@@ -615,6 +626,19 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
             .draw_series(std::iter::once(Rectangle::new(
                 [(x1, y1_log), (x2, y2_log)],
                 color.filled(),
+            )))
+            .ok();
+    }
+
+    // --- Draw vertical lines (e.g., alert fire timestamps) ---
+    for vline in &data.plots.vlines {
+        // Convert vline timestamp to milliseconds since chart start
+        let x = (vline.time - start_dt.timestamp_millis()) as f64;
+        let color = parse_hex_color_with_alpha(&vline.color);
+        chart_context
+            .draw_series(std::iter::once(PathElement::new(
+                vec![(x, min_log_for_chart), (x, max_log_for_chart)],
+                color.stroke_width(2),
             )))
             .ok();
     }
