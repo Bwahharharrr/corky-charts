@@ -1,14 +1,14 @@
-use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono::{DateTime, Local, LocalResult, TimeZone, Utc};
+use log::{debug, error, info, warn};
 use serde::Deserialize;
 use serde_json::from_str;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::{error::Error, fs, str, thread};
-use std::process::exit;
-use zmq;
-use colored::*;
-
 // Add plotters
 use plotters::prelude::*;
-use plotters::style::{RGBColor, RGBAColor, TextStyle, Color, IntoFont};
+use plotters::style::{Color, IntoFont, RGBAColor, RGBColor, TextStyle};
 
 /// Configuration structure for the charts section of the config file
 #[derive(Debug, Deserialize)]
@@ -28,25 +28,23 @@ fn get_output_directory() -> Result<String, Box<dyn Error>> {
     // Get the home directory using the dirs crate
     let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
     let config_path = home_dir.join(".corky").join("config.toml");
-    
+
     // Check if the config file exists
     if !config_path.exists() {
         return Err("Config file ~/.corky/config.toml not found".into());
     }
-    
+
     // Read and parse the TOML file
     let config_content = fs::read_to_string(config_path)?;
     let config: Config = toml::from_str(&config_content)?;
-    
+
     // Check if the charts section exists and has a directory
     match config.charts {
-        Some(charts_config) => {
-            match charts_config.directory {
-                Some(dir) => Ok(dir),
-                None => Err("Output directory not specified in [charts] section of config.toml".into())
-            }
+        Some(charts_config) => match charts_config.directory {
+            Some(dir) => Ok(dir),
+            None => Err("Output directory not specified in [charts] section of config.toml".into()),
         },
-        None => Err("[charts] section not found in config.toml".into())
+        None => Err("[charts] section not found in config.toml".into()),
     }
 }
 
@@ -61,14 +59,14 @@ pub struct ChartRequest(
 
 fn parse_hex_color(hex: &str) -> RGBColor {
     let hex = hex.trim_start_matches('#');
-    if hex.len() == 6 {
-        if let (Ok(r), Ok(g), Ok(b)) = (
+    if hex.len() == 6
+        && let (Ok(r), Ok(g), Ok(b)) = (
             u8::from_str_radix(&hex[0..2], 16),
             u8::from_str_radix(&hex[2..4], 16),
             u8::from_str_radix(&hex[4..6], 16),
-        ) {
-            return RGBColor(r, g, b);
-        }
+        )
+    {
+        return RGBColor(r, g, b);
     }
     // Default to gray if parsing fails
     RGBColor(128, 128, 128)
@@ -184,29 +182,50 @@ pub struct Plots {
     pub vlines: Vec<VLine>,
 }
 
+/// Safely convert milliseconds timestamp to local DateTime.
+/// Returns an error if the timestamp is invalid.
+fn safe_timestamp_to_local(millis: i64) -> Result<DateTime<Local>, Box<dyn Error>> {
+    match Utc.timestamp_millis_opt(millis) {
+        LocalResult::Single(utc_dt) => {
+            Ok(utc_dt.with_timezone(&Local))
+        }
+        _ => Err(format!("Invalid timestamp: {}", millis).into()),
+    }
+}
+
+/// Sanitize a path component by stripping dangerous characters
+fn sanitize_path_component(s: &str) -> String {
+    s.replace(['/', '\\'], "")
+        .replace("..", "")
+}
+
+/// Maximum concurrent chart threads
+static ACTIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
+const MAX_CONCURRENT_CHARTS: usize = 4;
+
 // ─── Main Logic ─────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Phase 6: Initialize structured logging
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .init();
+
     // Get the output directory from config file
-    // If it fails, print the error message and exit
-    let output_dir = match get_output_directory() {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("ERROR: {}", e);
-            exit(1);
-        }
-    };
-    
-    println!("{} {}", "[INIT]".blue().bold(), format!("Using output directory: {}", output_dir).white());
-    
+    let output_dir = get_output_directory()?;
+
+    info!("[INIT] Using output directory: {}", output_dir);
+
     let context = zmq::Context::new();
     let socket = context.socket(zmq::DEALER)?;
     socket.set_identity(b"rustcharts")?;
     let endpoint = "tcp://127.0.0.1:6565";
-    println!("{} {}", "[INIT]".blue().bold(), format!("Connecting to {} as 'rustcharts'…", endpoint).white());
+    info!("[INIT] Connecting to {} as 'rustcharts'…", endpoint);
     socket.connect(endpoint)?;
 
-    println!("{} {}", "[READY]".green().bold(), "Awaiting incoming chart messages…".white());
+    info!("[READY] Awaiting incoming chart messages…");
+
+    // Phase 4B: Share ZMQ context for notifications
+    let zmq_ctx = Arc::new(context);
 
     loop {
         let frames = socket.recv_multipart(0)?;
@@ -216,38 +235,58 @@ fn main() -> Result<(), Box<dyn Error>> {
             Some(json_str) => {
                 match from_str::<ChartRequest>(json_str) {
                     Ok(req) => {
-                        // Add a yellow separator line before each new chart request
-                        println!("{} {}", 
-                            "╔".yellow(), 
-                            "══════════════════════════════════════════════════════════════════════".yellow()
+                        info!(
+                            "╔══════════════════════════════════════════════════════════════════════"
                         );
-                        
-                        println!(
-                            "{} {} {}",
-                            format!("[{}]", now).dimmed(),
-                            "▶".cyan().bold(),
-                            format!("New Chart Request for {} @ {} [{} candles]", 
-                                req.2.ticker.bold().yellow(), 
-                                req.2.timeframe.bold(), 
-                                req.2.data.len().to_string().bold().green()
-                            )
+
+                        info!(
+                            "[{}] ▶ New Chart Request for {} @ {} [{} candles]",
+                            now,
+                            req.2.ticker,
+                            req.2.timeframe,
+                            req.2.data.len()
                         );
                         log_data_summary(&req.2);
 
-                        // Spawn a thread for chart generation and pass the output directory
-                        let chart_data = req.2.clone();
+                        // Phase 2: Concurrent thread limit
+                        let current = ACTIVE_THREADS.load(Ordering::SeqCst);
+                        if current >= MAX_CONCURRENT_CHARTS {
+                            warn!(
+                                "[CHART] Dropping request for {} — {} threads active (max {})",
+                                req.2.ticker, current, MAX_CONCURRENT_CHARTS
+                            );
+                            continue;
+                        }
+
+                        // Phase 5B: Use Arc instead of clone
+                        let chart_data = Arc::new(req.2);
                         let output_dir_clone = output_dir.clone();
+                        let zmq_ctx_clone = Arc::clone(&zmq_ctx);
+
+                        ACTIVE_THREADS.fetch_add(1, Ordering::SeqCst);
+
                         thread::spawn(move || {
-                            handle_chart_request(chart_data, &output_dir_clone);
+                            // Phase 2: Wrap in catch_unwind for panic protection
+                            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                handle_chart_request(&chart_data, &output_dir_clone, &zmq_ctx_clone)
+                            }));
+
+                            ACTIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
+
+                            match result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => error!("[CHART] Chart generation failed: {}", e),
+                                Err(_) => error!("[CHART] Chart thread panicked"),
+                            }
                         });
                     }
                     Err(e) => {
-                        eprintln!("[{}] ✘ Failed to parse ChartRequest: {}", now, e);
+                        error!("[{}] Failed to parse ChartRequest: {}", now, e);
                     }
                 }
             }
             None => {
-                eprintln!("[{}] ✘ Received invalid or missing JSON payload", now);
+                error!("[{}] Received invalid or missing JSON payload", now);
             }
         }
     }
@@ -257,33 +296,47 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn log_data_summary(data: &ChartData) {
     if let (Some(first), Some(last)) = (data.data.first(), data.data.last()) {
+        // Phase 3B: Guard against empty rows
+        if first.is_empty() || last.is_empty() {
+            warn!("       Data rows are empty, cannot summarize.");
+            return;
+        }
+
         let start_ts = first[0] as i64;
         let end_ts = last[0] as i64;
-        let start_dt: DateTime<Local> =
-            DateTime::<Utc>::from(Utc.timestamp_millis_opt(start_ts).unwrap())
-                .with_timezone(&Local);
-        let end_dt: DateTime<Local> =
-            DateTime::<Utc>::from(Utc.timestamp_millis_opt(end_ts).unwrap())
-                .with_timezone(&Local);
 
-        println!(
-            "       {} candles from {} to {}",
-            data.data.len(),
-            start_dt.format("%Y-%m-%d %H:%M:%S"),
-            end_dt.format("%Y-%m-%d %H:%M:%S"),
-        );
-        println!("       Desc: {}", data.desc);
+        match (
+            safe_timestamp_to_local(start_ts),
+            safe_timestamp_to_local(end_ts),
+        ) {
+            (Ok(start_dt), Ok(end_dt)) => {
+                info!(
+                    "       {} candles from {} to {}",
+                    data.data.len(),
+                    start_dt.format("%Y-%m-%d %H:%M:%S"),
+                    end_dt.format("%Y-%m-%d %H:%M:%S"),
+                );
+                info!("       Desc: {}", data.desc);
+            }
+            _ => {
+                warn!("       Could not parse timestamps for summary");
+            }
+        }
     } else {
-        println!("       No candle data available.");
+        info!("       No candle data available.");
     }
 }
 
 // ─── Actual Chart Handler with Plotters ─────────────────────────────────────────
 
-fn handle_chart_request(data: ChartData, output_dir: &str) {
+fn handle_chart_request(
+    data: &ChartData,
+    output_dir: &str,
+    zmq_ctx: &zmq::Context,
+) -> Result<(), Box<dyn Error>> {
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
-    println!(
-        "[{}] 🖼️  Processing chart: '{}' with {} candles",
+    info!(
+        "[{}] Processing chart: '{}' with {} candles",
         now,
         data.title,
         data.data.len()
@@ -291,17 +344,22 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
 
     // If there's no data, nothing to do
     if data.data.is_empty() {
-        eprintln!("No data found for chart: {}", data.title);
-        return;
+        warn!("No data found for chart: {}", data.title);
+        return Ok(());
     }
 
-    // Ensure output directory exists
-    fs::create_dir_all(output_dir).ok();
+    // Phase 3G: Propagate directory creation errors
+    fs::create_dir_all(output_dir)?;
 
-    // Use image_filename if provided (unique per alert), otherwise fall back to ticker_timeframe
+    // Phase 3F: Sanitize file path components
     let file_path = match &data.image_filename {
-        Some(filename) => format!("{}/{}", output_dir, filename),
-        None => format!("{}/{}_{}.png", output_dir, data.ticker, data.timeframe),
+        Some(filename) => format!("{}/{}", output_dir, sanitize_path_component(filename)),
+        None => format!(
+            "{}/{}_{}.png",
+            output_dir,
+            sanitize_path_component(&data.ticker),
+            sanitize_path_component(&data.timeframe)
+        ),
     };
 
     // --- 1) Parse Timestamps and OHLCV; find min & max for Y ---
@@ -314,17 +372,19 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
     let first_ts = data.data[0][0] as i64;
     let last_ts = data.data[candle_count - 1][0] as i64;
 
-    let start_dt: DateTime<Local> =
-        DateTime::<Utc>::from(Utc.timestamp_millis_opt(first_ts).unwrap())
-            .with_timezone(&Local);
-    let end_dt: DateTime<Local> =
-        DateTime::<Utc>::from(Utc.timestamp_millis_opt(last_ts).unwrap())
-            .with_timezone(&Local);
+    let start_dt: DateTime<Local> = safe_timestamp_to_local(first_ts)?;
+    let end_dt: DateTime<Local> = safe_timestamp_to_local(last_ts)?;
 
     // We will store the data in a vector of (DateTime<Local>, open, high, low, close, volume, color_hex)
     let mut processed_data = Vec::with_capacity(candle_count);
 
     for (i, row) in data.data.iter().enumerate() {
+        // Phase 3A: Validate row lengths — skip rows with < 5 elements
+        if row.len() < 5 {
+            warn!("Skipping row {} with only {} elements (need >= 5)", i, row.len());
+            continue;
+        }
+
         // row: [ts, open, high, low, close, volume] (assuming exactly that structure)
         let ts = row[0] as i64;
         let o = row[1].max(1e-12);
@@ -345,9 +405,7 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
             max_volume = v;
         }
 
-        let dt_local: DateTime<Local> =
-            DateTime::<Utc>::from(Utc.timestamp_millis_opt(ts).unwrap())
-                .with_timezone(&Local);
+        let dt_local: DateTime<Local> = safe_timestamp_to_local(ts)?;
 
         // If for some reason we have fewer colors than candles, fallback to black
         let color_hex = data
@@ -359,38 +417,38 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
         processed_data.push((dt_local, o, h, l, c, v, color_hex));
     }
 
-    // Find highest and lowest price for reference
-    let mut highest_price = 0.0;
-    let mut lowest_price = f64::MAX;
-    for (_, _, h, l, _, _, _) in &processed_data {
-        if *h > highest_price {
-            highest_price = *h;
-        }
-        if *l < lowest_price {
-            lowest_price = *l;
-        }
+    // Phase 3E: Guard against empty processed data (all rows skipped)
+    if processed_data.is_empty() {
+        return Err("No valid candle data after processing".into());
     }
 
-    let log_highest = highest_price.ln();
-    let log_lowest = lowest_price.ln();
+    // Phase 5A: Reuse min/max from first loop instead of redundant second pass
+    let highest_price = max_price;
+    let lowest_price = min_price;
 
-    let min_log = lowest_price.ln();
-    let max_log = highest_price.ln();
+    // Phase 3D: Guard ln() on zero/negative
+    if highest_price <= 0.0 || lowest_price <= 0.0 {
+        return Err(format!(
+            "Invalid price range: highest={}, lowest={}",
+            highest_price, lowest_price
+        )
+        .into());
+    }
+
+    let min_log_for_chart = lowest_price.ln();
 
     // Add a bit of padding to the max price (0.2%) to ensure highest candle is visible
     let padding_factor = 1.002;
     let padded_max_price = highest_price * padding_factor;
-    let padded_max_log = padded_max_price.ln();
-
-    let min_log_for_chart = min_log;
-    let max_log_for_chart = padded_max_log;
+    let max_log_for_chart = padded_max_price.ln();
 
     // Increase plot dimensions for a larger chart
     let plot_width = 1280;
     let plot_height = 960;
-    let root_area = BitMapBackend::new(&file_path, (plot_width, plot_height)).into_drawing_area();
-    root_area.fill(&WHITE).unwrap();
-    
+    let root_area =
+        BitMapBackend::new(&file_path, (plot_width, plot_height)).into_drawing_area();
+    root_area.fill(&WHITE)?;
+
     // Log price range in a clean format
     let format_with_commas = |price: f64| -> String {
         let price_int = price.round() as i64;
@@ -400,34 +458,33 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
             .rev()
             .map(std::str::from_utf8)
             .collect::<Result<Vec<&str>, _>>()
-            .unwrap()
+            .unwrap_or_else(|_| vec!["?"])
             .join(",")
     };
-    
-    println!(
-        "{} ${} - ${}",
-        "Price range:".dimmed(),
-        format_with_commas(lowest_price).bold().green(),
-        format_with_commas(highest_price).bold().green()
+
+    debug!(
+        "Price range: ${} - ${}",
+        format_with_commas(lowest_price),
+        format_with_commas(highest_price)
     );
-    
+
     // Allocate more height for the table area and include title space
     let title_height = 40; // Dedicated space for the title
     let table_height = 100; // More height for the table
     let header_height = title_height + table_height;
-    
+
     // Split the drawing area into three parts: title, table, and chart
     let (header_area, chart_area) = root_area.split_vertically(header_height);
     let (title_area, table_area) = header_area.split_vertically(title_height);
-    
+
     // Apply horizontal margin to the table area (inset from left and right)
     let margin_percent = 0.15; // 15% margin on each side
     let left_margin = (plot_width as f64 * margin_percent) as u32;
     let right_margin = plot_width - (plot_width as f64 * margin_percent) as u32;
     // Split into left margin, table area, and right margin
-    let (left_area, rest) = table_area.split_horizontally(left_margin);
-    let (table_area, right_area) = rest.split_horizontally(right_margin - left_margin);
-    
+    let (_left_area, rest) = table_area.split_horizontally(left_margin);
+    let (table_area, _right_area) = rest.split_horizontally(right_margin - left_margin);
+
     let effective_chart_area_width = plot_width as f64 * 0.85;
     let num_candles = processed_data.len();
 
@@ -435,8 +492,7 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
     let candles_to_fit = num_candles as f64;
 
     let total_gap_space = pixel_gap_between_candles * (candles_to_fit - 1.0);
-    let available_width = effective_chart_area_width - total_gap_space;
-    let candle_width_pixels = (available_width / candles_to_fit).floor();
+    let _available_width = effective_chart_area_width - total_gap_space;
 
     // Tighter right edge in time
     let last_candle_time = processed_data
@@ -447,17 +503,15 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
     // Instead of calculating the exact milliseconds per pixel (which can cause overflow),
     // we'll use a safer approach with relative positioning
     let total_time_span_millis = tight_end_dt.timestamp_millis() - start_dt.timestamp_millis();
-    
+
     // Safety check to avoid potential overflow
     if total_time_span_millis <= 0 || total_time_span_millis > i64::MAX / 2 {
-        eprintln!("Warning: Time span is too large or invalid, adjusting calculations");
+        warn!("Time span is too large or invalid, adjusting calculations");
     }
-    
-    // Use f64 for all calculations to avoid integer overflow
-    let millis_per_pixel = total_time_span_millis as f64 / effective_chart_area_width;
 
     let volume_visible_bottom = min_log_for_chart;
-    let volume_visible_top = min_log_for_chart + (0.15 * (max_log_for_chart - min_log_for_chart));
+    let volume_visible_top =
+        min_log_for_chart + (0.15 * (max_log_for_chart - min_log_for_chart));
 
     let log_to_price = |log_val: f64| -> f64 { log_val.exp() };
     let volume_to_log_scale = |vol: f64| -> f64 {
@@ -468,84 +522,77 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
         volume_visible_bottom + (normalized_vol * (volume_visible_top - volume_visible_bottom))
     };
 
-    // Create a narrower time range for the chart to avoid datetime calculations that cause integer overflow
-    // The issue is in the Plotters library's datetime range handling when dealing with large time spans
-    
-    // Instead of using the full DateTime objects directly, we'll create a modified time range
-    // that uses smaller time units and won't trigger the overflow in Plotters' internal calculations
-    
-    // Create a simpler time range - use milliseconds since start as the x-axis unit
-    // This avoids any potential issues with the Plotters library's datetime handling
     let millis_since_start = |dt: DateTime<Local>| -> i64 {
         dt.timestamp_millis() - start_dt.timestamp_millis()
     };
-    
+
     // Calculate millisecond values for start and end points
     let start_millis = 0; // 0 milliseconds since start
     let end_millis = millis_since_start(end_dt);
-    
+
     // Calculate the duration of one candle in milliseconds
     let total_candles = processed_data.len() as f64;
     let candle_duration_ms = (end_millis - start_millis) as f64 / total_candles;
-    
+
     // Add 3 candles worth of space to the end
     let padded_end_millis = end_millis as f64 + (candle_duration_ms * 3.0);
-    
-    println!("  - Time range converted to milliseconds: {} to {} ms (with padding: {} ms)", 
-        start_millis, end_millis, padded_end_millis);
-    
+
+    debug!(
+        "  - Time range converted to milliseconds: {} to {} ms (with padding: {} ms)",
+        start_millis, end_millis, padded_end_millis
+    );
+
     // Build the chart using milliseconds since start instead of DateTime objects or hours
-    // Move price axis to right side as requested and maximize vertical space
-    let mut chart_context = ChartBuilder::on(&chart_area) // Use chart_area instead of root_area
-        // Reduce margins to maximize plot space
-        .margin(10) // Keep top/left/right margin small
-        .margin_bottom(20) // Significantly reduce bottom margin (was 60)
-        // Remove left label area and move to right side
+    let mut chart_context = ChartBuilder::on(&chart_area)
+        .margin(10)
+        .margin_bottom(20)
         .set_label_area_size(LabelAreaPosition::Left, 0)
-        .set_label_area_size(LabelAreaPosition::Right, 80) // Make right side wider for price labels
-        .set_label_area_size(LabelAreaPosition::Bottom, 40) // Reduced from 60
-        .build_cartesian_2d((start_millis as f64)..padded_end_millis, min_log_for_chart..max_log_for_chart)
-        .unwrap();
-        
+        .set_label_area_size(LabelAreaPosition::Right, 80)
+        .set_label_area_size(LabelAreaPosition::Bottom, 40)
+        .build_cartesian_2d(
+            (start_millis as f64)..padded_end_millis,
+            min_log_for_chart..max_log_for_chart,
+        )?;
+
     // Title is centered in its own dedicated area at the very top of the canvas
-    // Need to center it properly on the full canvas width
-    let title_style = TextStyle::from(("sans-serif", 24))
-        .color(&BLACK);
-        
+    let title_style = TextStyle::from(("sans-serif", 24)).color(&BLACK);
+
     // Calculate the exact center of the entire canvas width (not just title area)
-    let title_pos = ((plot_width/2) as i32, title_height/2); // Center X coordinate based on full width
-    
+    let _title_pos = ((plot_width / 2) as i32, title_height / 2);
+
     // Draw a white background for the title area
-    title_area.fill(&WHITE).unwrap();
-    
-    // Draw the title text - we need to use draw_text with horizontal alignment
-    // to ensure it's properly centered, taking into account the Y-axis width
-    let text_width = data.title.len() as i32 * 15; // Estimate text width
-    let y_axis_width = 80; // The width of the Y-axis on the right side
-    
-    // Add a shift to compensate for the Y-axis on the right
-    // We shift by y_axis_width/2 to center the title on the plot area, not including the y-axis
+    title_area.fill(&WHITE)?;
+
+    // Draw the title text
+    let text_width = data.title.len() as i32 * 15;
+    let y_axis_width = 80;
+
     let centered_x = (plot_width as i32 / 2) - (text_width / 2) + (y_axis_width / 2);
-    
+
     title_area.draw_text(
         &data.title,
         &title_style,
-        (centered_x, title_height/2), // Adjusted position to account for Y-axis
-    ).unwrap();
-    
+        (centered_x, title_height / 2),
+    )?;
+
     // Clear the table area with white before we begin
-    table_area.fill(&WHITE).unwrap();
-        
+    table_area.fill(&WHITE)?;
+
     // Create a formatter to convert milliseconds back to readable dates
     let millis_to_datetime = |millis: &f64| -> String {
         let dt = start_dt + chrono::Duration::milliseconds(*millis as i64);
         dt.format("%m-%d %H:%M").to_string()
     };
-    
+
+    // Phase 5D: Pre-compute candle/wick widths before draw loops
+    let total_millis_span = (end_millis as f64) - (start_millis as f64);
+    let candle_width = total_millis_span / processed_data.len() as f64 * 0.8;
+    let wick_width = candle_width * 0.15;
+
     chart_context
         .configure_mesh()
-        .light_line_style(&RGBColor(235, 235, 235))
-        .axis_style(&RGBColor(150, 150, 150))
+        .light_line_style(RGBColor(235, 235, 235))
+        .axis_style(RGBColor(150, 150, 150))
         .x_labels(16)
         .x_label_formatter(&millis_to_datetime)
         .y_labels(8)
@@ -571,13 +618,12 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
                 .rev()
                 .map(std::str::from_utf8)
                 .collect::<Result<Vec<&str>, _>>()
-                .unwrap()
+                .unwrap_or_else(|_| vec!["?"])
                 .join(",");
             format!("${}", formatted)
         })
         .y_desc("Price")
-        .draw()
-        .unwrap();
+        .draw()?;
 
     // Add some horizontal grid lines
     let y_step = (max_log_for_chart - min_log_for_chart) / 8.0;
@@ -588,12 +634,13 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
         } else {
             RGBColor(240, 240, 240).stroke_width(1)
         };
-        chart_context
-            .draw_series(std::iter::once(PathElement::new(
-                vec![(start_millis as f64, y_pos), (end_millis as f64, y_pos)],
-                line_style,
-            )))
-            .unwrap();
+        chart_context.draw_series(std::iter::once(PathElement::new(
+            vec![
+                (start_millis as f64, y_pos),
+                (end_millis as f64, y_pos),
+            ],
+            line_style,
+        )))?;
     }
 
     // Add a few vertical grid lines (using hours-based coordinates)
@@ -601,46 +648,42 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
     let x_step = x_range / 5.0;
     for i in 0..6 {
         let x_pos = (start_millis as f64) + (x_step * i as f64);
-        chart_context
-            .draw_series(std::iter::once(PathElement::new(
-                vec![(x_pos, min_log_for_chart), (x_pos, max_log_for_chart)],
-                RGBColor(245, 245, 245).stroke_width(1),
-            )))
-            .unwrap();
+        chart_context.draw_series(std::iter::once(PathElement::new(
+            vec![(x_pos, min_log_for_chart), (x_pos, max_log_for_chart)],
+            RGBColor(245, 245, 245).stroke_width(1),
+        )))?;
     }
 
     // --- Draw zones (semi-transparent rectangles behind everything) ---
     for zone in &data.plots.zones {
-        // Convert zone timestamps to milliseconds since chart start
         let x1 = (zone.x1 - start_dt.timestamp_millis()) as f64;
         let x2 = (zone.x2 - start_dt.timestamp_millis()) as f64;
 
-        // Convert prices to log scale (matching chart's y-axis)
         let y1_log = zone.y1.max(1e-12).ln();
         let y2_log = zone.y2.max(1e-12).ln();
 
-        // Parse color with alpha
         let color = parse_hex_color_with_alpha(&zone.color);
 
-        chart_context
-            .draw_series(std::iter::once(Rectangle::new(
-                [(x1, y1_log), (x2, y2_log)],
-                color.filled(),
-            )))
-            .ok();
+        // Phase 4A: Log zone draw failures
+        if let Err(e) = chart_context.draw_series(std::iter::once(Rectangle::new(
+            [(x1, y1_log), (x2, y2_log)],
+            color.filled(),
+        ))) {
+            warn!("Failed to draw zone: {}", e);
+        }
     }
 
     // --- Draw vertical lines (e.g., alert fire timestamps) ---
     for vline in &data.plots.vlines {
-        // Convert vline timestamp to milliseconds since chart start
         let x = (vline.time - start_dt.timestamp_millis()) as f64;
         let color = parse_hex_color_with_alpha(&vline.color);
-        chart_context
-            .draw_series(std::iter::once(PathElement::new(
-                vec![(x, min_log_for_chart), (x, max_log_for_chart)],
-                color.stroke_width(2),
-            )))
-            .ok();
+        // Phase 4A: Log vline draw failures
+        if let Err(e) = chart_context.draw_series(std::iter::once(PathElement::new(
+            vec![(x, min_log_for_chart), (x, max_log_for_chart)],
+            color.stroke_width(2),
+        ))) {
+            warn!("Failed to draw vline: {}", e);
+        }
     }
 
     // --- Volume bars (draw behind candles) ---
@@ -650,18 +693,16 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
                 .iter()
                 .enumerate()
                 .map(|(idx, (dt, _o, _h, _l, _c, v, _color_hex))| {
-                    // Use the same hours-based approach as for candlesticks
                     let dt_hours = millis_since_start(*dt) as f64;
-                    let candle_width_in_hours = ((end_millis as f64) - (start_millis as f64)) / processed_data.len() as f64 * 0.8;
-                    
-                    let x0 = dt_hours - (candle_width_in_hours / 2.0);
-                    let x1 = dt_hours + (candle_width_in_hours / 2.0);
+                    // Phase 5D: Use pre-computed candle_width
+                    let x0 = dt_hours - (candle_width / 2.0);
+                    let x1 = dt_hours + (candle_width / 2.0);
 
                     let y_bottom = volume_visible_bottom;
                     let y_top = volume_to_log_scale(*v);
 
-                    // Use volume color if available, otherwise default to gray
-                    let volume_color = data.volume_colors
+                    let volume_color = data
+                        .volume_colors
                         .as_ref()
                         .and_then(|colors| colors.get(idx).cloned())
                         .map(|color| parse_hex_color(&color))
@@ -672,20 +713,21 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
                         volume_color.mix(0.8).filled(),
                     )
                 }),
-        )
-        .unwrap();
+        )?;
 
     // Sort data by timestamp to ensure correct order for candle drawing
     processed_data.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Format price with commas for better readability is now done earlier in the code
-
     // --- Draw the dotted line for current price on the last candle ---
     let last_candle = processed_data.last().cloned();
-    let current_price = last_candle.as_ref().map(|(_, _, _, _, c, _, _)| *c).unwrap_or(0.0);
+    // Phase 3D: Use 1e-12 instead of 0.0 fallback for current_price to protect ln()
+    let current_price = last_candle
+        .as_ref()
+        .map(|(_, _, _, _, c, _, _)| *c)
+        .unwrap_or(1e-12);
     let current_price_log = current_price.ln();
 
-    let (is_green, last_candle_color) = if let Some((_, o, _, _, c, _, _)) = last_candle {
+    let (_is_green, last_candle_color) = if let Some((_, o, _, _, c, _, _)) = last_candle {
         let is_up = c >= o;
         if is_up {
             (true, RGBColor(0, 150, 0))
@@ -698,195 +740,173 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
 
     let formatted_current_price = format_with_commas(current_price);
 
-    // No longer need the old price line and label here, as we've redesigned the price display
-
     // Draw a single horizontal line at the current price level for reference
-    chart_context
-        .draw_series(std::iter::once(PathElement::new(
-            vec![(start_millis as f64, current_price_log), (end_millis as f64, current_price_log)],
-            RGBColor(100, 100, 100).stroke_width(1)
-        )))
-        .unwrap();
-        
+    chart_context.draw_series(std::iter::once(PathElement::new(
+        vec![
+            (start_millis as f64, current_price_log),
+            (end_millis as f64, current_price_log),
+        ],
+        RGBColor(100, 100, 100).stroke_width(1),
+    )))?;
+
     // Now draw the table in table_area instead of showing the price on the chart
     // Find the highest price in the visible plot
-    let highest_price = processed_data.iter()
+    let highest_price = processed_data
+        .iter()
         .map(|(_, _, h, _, _, _, _)| *h)
         .fold(f64::NEG_INFINITY, f64::max);
-        
+
     // Calculate percentage from high
     let percent_from_high = if highest_price > 0.0 {
         ((highest_price - current_price) / highest_price) * 100.0
     } else {
         0.0
     };
-    
+
     // Table setup
-    let rows = vec!["Current Price", "High (in plot)", "% from High"];
-    let cols = vec!["Value"];
-    let table_data = vec![
-        vec![format!("${}", formatted_current_price)],
-        vec![format!("${}", format_with_commas(highest_price))],
-        vec![format!("{:.2}%", percent_from_high)],
+    let rows = ["Current Price", "High (in plot)", "% from High"];
+    let table_data = [
+        format!("${}", formatted_current_price),
+        format!("${}", format_with_commas(highest_price)),
+        format!("{:.2}%", percent_from_high),
     ];
 
     // Compute cell sizes
-    let cell_w = plot_width as f64 / 2.0; // Make table take half the width
     let cell_h = table_height as f64 / (rows.len() + 1) as f64;
-    
+
     // First, fill the table area with white for a clean background
-    // This creates the white spacing between cells
-    table_area.fill(&WHITE).unwrap();
-    
+    table_area.fill(&WHITE)?;
+
     // Setup for cell drawing
-    let cell_padding = 5; // Space between cells in pixels (increased padding)
-    let section_width = (table_area.get_pixel_range().0.end - table_area.get_pixel_range().0.start) as i32;
+    let cell_padding = 5;
+    let section_width = table_area.get_pixel_range().0.end
+        - table_area.get_pixel_range().0.start;
     let mid_point = section_width / 2;
-    
+
     // Calculate optimal row height with spacing
-    let row_spacing = (cell_h * 0.15) as i32; // 15% of row height as spacing
+    let row_spacing = (cell_h * 0.15) as i32;
     let effective_row_height = cell_h as i32 - row_spacing;
-    
+
     // Cell background color - medium grey for good visibility
     let cell_bg_color = RGBColor(220, 220, 220);
-    
+
     // Additional padding for bottom of cells
-    let bottom_padding = 6; // Extra bottom padding for cells
-    
+    let bottom_padding = 6;
+
     for (ri, row_label) in rows.iter().enumerate() {
         // Calculate position with proper spacing between rows
-        let row_pos = (ri as i32 * (effective_row_height + row_spacing + bottom_padding)) + cell_padding;
+        let row_pos =
+            (ri as i32 * (effective_row_height + row_spacing + bottom_padding)) + cell_padding;
         let row_height = effective_row_height;
         let row_center = row_pos + (row_height / 2);
-        
+
         // Text color based on data
-        let text_color = if ri == 0 { &last_candle_color } else { &BLACK };
-        
+        let text_color = if ri == 0 {
+            &last_candle_color
+        } else {
+            &BLACK
+        };
+
         // Draw left column cell with padding on all sides
         table_area.draw(&Rectangle::new(
-            [(cell_padding, row_pos), 
-             (mid_point - cell_padding, row_pos + row_height)],
-            cell_bg_color.filled()
-        )).unwrap();
-        
+            [
+                (cell_padding, row_pos),
+                (mid_point - cell_padding, row_pos + row_height),
+            ],
+            cell_bg_color.filled(),
+        ))?;
+
         // Draw right column cell with padding on all sides
         table_area.draw(&Rectangle::new(
-            [(mid_point + cell_padding, row_pos), 
-             (section_width - cell_padding, row_pos + row_height)],
-            cell_bg_color.filled()
-        )).unwrap();
-        
-        // Calculate better vertical position to ensure text is centered in the cell
-        // Move text up more from center for better vertical alignment and to add bottom padding effect
-        let text_y_adjustment = 4; // Increased shift up for more bottom padding appearance
+            [
+                (mid_point + cell_padding, row_pos),
+                (section_width - cell_padding, row_pos + row_height),
+            ],
+            cell_bg_color.filled(),
+        ))?;
+
+        let text_y_adjustment = 4;
         let text_y_pos = row_center - text_y_adjustment;
-        
+
         // Left column text (label) with proper vertical alignment
         table_area.draw(&Text::new(
             row_label.to_string(),
-            (cell_padding*4, text_y_pos), // Left padding with adjusted vertical position
+            (cell_padding * 4, text_y_pos),
             ("sans-serif", 14).into_font().color(text_color),
-        )).unwrap();
-        
+        ))?;
+
         // Right column text (value) with proper vertical alignment
         table_area.draw(&Text::new(
-            table_data[ri][0].clone(),
-            (mid_point + cell_padding*4, text_y_pos), // Left padding with adjusted vertical position
+            table_data[ri].clone(),
+            (mid_point + cell_padding * 4, text_y_pos),
             ("sans-serif", 14).into_font().color(text_color),
-        )).unwrap();
+        ))?;
     }
-    
+
     // Add a horizontal line at the current price level using the same color as the last candle
-    chart_context
-        .draw_series(std::iter::once(PathElement::new(
-            vec![(start_millis as f64, current_price_log), (end_millis as f64, current_price_log)],
-            last_candle_color.stroke_width(1)
-        )))
-        .unwrap();
-    
-    // We'll skip drawing the rectangle and text overlay since we're now
-    // highlighting the price directly in the y-axis labels
+    chart_context.draw_series(std::iter::once(PathElement::new(
+        vec![
+            (start_millis as f64, current_price_log),
+            (end_millis as f64, current_price_log),
+        ],
+        last_candle_color.stroke_width(1),
+    )))?;
 
-    // We're no longer drawing the rectangle and text here since we're highlighting
-    // the price directly in the y-axis labels
-        
     // --- Draw the candlestick bodies (no wicks) with consistent spacing ---
-    // Debug information removed for cleaner output
-        
+
     // First draw the wicks (thin dark grey rectangles) so they appear behind the candle bodies
-    chart_context
-        .draw_series(
-            processed_data
-                .iter()
-                .enumerate()
-                .map(|(idx, (dt, _o, h, l, _c, _v, _color_hex))| {
-                    // Convert to milliseconds since start for x-axis positioning
-                    let dt_millis = millis_since_start(*dt) as f64;
-                    
-                    // Calculate candle and wick widths
-                    let total_millis = (end_millis as f64) - (start_millis as f64);
-                    let candle_width = total_millis / processed_data.len() as f64 * 0.8; // 80% of available space
-                    let wick_width = candle_width * 0.15; // 15% of candle width for the wick
-                    
-                    // Calculate wick position (center of the candle)
-                    let wick_left = dt_millis - (wick_width / 2.0);
-                    let wick_right = dt_millis + (wick_width / 2.0);
-                    
-                    // Convert high and low to log scale for plotting
-                    let high_log = h.ln();
-                    let low_log = l.ln();
-                    
-                    // Return a dark grey rectangle for the wick
-                    Rectangle::new(
-                        [(wick_left, high_log), (wick_right, low_log)],
-                        RGBColor(70, 70, 70).filled()
-                    )
-                })
-        )
-        .unwrap();
-    
+    chart_context.draw_series(
+        processed_data
+            .iter()
+            .map(|(dt, _o, h, l, _c, _v, _color_hex)| {
+                let dt_millis = millis_since_start(*dt) as f64;
+
+                // Phase 5D: Use pre-computed wick_width
+                let wick_left = dt_millis - (wick_width / 2.0);
+                let wick_right = dt_millis + (wick_width / 2.0);
+
+                let high_log = h.ln();
+                let low_log = l.ln();
+
+                Rectangle::new(
+                    [(wick_left, high_log), (wick_right, low_log)],
+                    RGBColor(70, 70, 70).filled(),
+                )
+            }),
+    )?;
+
     // Next draw the candle bodies on top of the wicks
-    chart_context
-        .draw_series(
-            processed_data
-                .iter()
-                .enumerate()
-                .map(|(idx, (dt, o, h, l, c, _v, color_hex))| {
-                    let open_log = o.ln();
-                    let close_log = c.ln();
+    chart_context.draw_series(
+        processed_data
+            .iter()
+            .map(|(dt, o, _h, _l, c, _v, color_hex)| {
+                let open_log = o.ln();
+                let close_log = c.ln();
 
-                    // Parse the color from hex
-                    let txt = color_hex.trim_start_matches('#');
-                    let rgb = u32::from_str_radix(txt, 16).unwrap_or(0);
-                    let r = ((rgb >> 16) & 0xFF) as u8;
-                    let g = ((rgb >> 8) & 0xFF) as u8;
-                    let b = (rgb & 0xFF) as u8;
-                    let candle_color = RGBColor(r, g, b);
+                let txt = color_hex.trim_start_matches('#');
+                let rgb = u32::from_str_radix(txt, 16).unwrap_or(0);
+                let r = ((rgb >> 16) & 0xFF) as u8;
+                let g = ((rgb >> 8) & 0xFF) as u8;
+                let b = (rgb & 0xFF) as u8;
+                let candle_color = RGBColor(r, g, b);
 
-                    // Determine candle body top and bottom (based on open/close)
-                    let (body_top, body_bottom) = if open_log <= close_log {
-                        (close_log, open_log)
-                    } else {
-                        (open_log, close_log)
-                    };
+                let (body_top, body_bottom) = if open_log <= close_log {
+                    (close_log, open_log)
+                } else {
+                    (open_log, close_log)
+                };
 
-                    // Calculate candle width and position
-                    let total_millis = (end_millis as f64) - (start_millis as f64);
-                    let candle_width = total_millis / processed_data.len() as f64 * 0.8; // 80% of available space
-                    let dt_millis = millis_since_start(*dt) as f64;
-                    let body_left = dt_millis - (candle_width / 2.0);
-                    let body_right = dt_millis + (candle_width / 2.0);
-                    
-                    // Debug output removed for cleaner logs
-                    
-                    // Return the rectangle for the candle body
-                    Rectangle::new(
-                        [(body_left, body_top), (body_right, body_bottom)],
-                        candle_color.filled()
-                    )
-                })
-        )
-        .unwrap();
+                // Phase 5D: Use pre-computed candle_width
+                let dt_millis = millis_since_start(*dt) as f64;
+                let body_left = dt_millis - (candle_width / 2.0);
+                let body_right = dt_millis + (candle_width / 2.0);
+
+                Rectangle::new(
+                    [(body_left, body_top), (body_right, body_bottom)],
+                    candle_color.filled(),
+                )
+            }),
+    )?;
 
     // --- Draw markers from plots.marks ---
     let candle_duration_millis = if processed_data.len() > 1 {
@@ -897,23 +917,39 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
     };
     let marker_candle_width = candle_duration_millis * 0.8;
 
+    // Phase 5C: Pre-build sorted timestamp vec for binary search
+    let candle_timestamps: Vec<i64> = processed_data
+        .iter()
+        .map(|(dt, _, _, _, _, _, _)| millis_since_start(*dt))
+        .collect();
+
     for mark in &data.plots.marks {
-        // Convert mark timestamp to milliseconds since chart start
         let mark_time_millis = mark.time - start_dt.timestamp_millis();
         let x = mark_time_millis as f64;
 
-        // Find candle at this timestamp to get high/low for positioning
-        // Allow small tolerance for timestamp matching (within half a candle duration)
-        let candle_idx = processed_data.iter().position(|(dt, _, _, _, _, _, _)| {
-            let dt_millis = millis_since_start(*dt);
-            (dt_millis - mark_time_millis).abs() < (candle_duration_millis as i64 / 2)
-        });
+        // Phase 5C: Binary search for candle lookup O(log N) instead of O(N)
+        let half_candle = (candle_duration_millis as i64) / 2;
+        let candle_idx = {
+            let pos = candle_timestamps.partition_point(|&t| t < mark_time_millis);
+            // Check the candidate and its neighbor for closest match
+            let mut found = None;
+            if pos < candle_timestamps.len()
+                && (candle_timestamps[pos] - mark_time_millis).abs() < half_candle
+            {
+                found = Some(pos);
+            } else if pos > 0
+                && (candle_timestamps[pos - 1] - mark_time_millis).abs() < half_candle
+            {
+                found = Some(pos - 1);
+            }
+            found
+        };
 
         if let Some(idx) = candle_idx {
             let (_, _, h, l, _, _, _) = &processed_data[idx];
             let size = mark.size;
             let log_range = max_log_for_chart - min_log_for_chart;
-            let offset = log_range * 0.02 * size; // 2% of price range per size unit
+            let offset = log_range * 0.02 * size;
 
             let y = if mark.position == "above" {
                 h.ln() + offset
@@ -927,29 +963,23 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
 
             // Draw triangle marker
             if mark.position == "above" {
-                // Downward-pointing triangle (▼) above candle, pointing at the high
-                chart_context
-                    .draw_series(std::iter::once(Polygon::new(
-                        vec![
-                            (x, y - triangle_height),           // Bottom point (pointing down)
-                            (x - triangle_half_width, y + triangle_height), // Top left
-                            (x + triangle_half_width, y + triangle_height), // Top right
-                        ],
-                        color.filled(),
-                    )))
-                    .unwrap();
+                chart_context.draw_series(std::iter::once(Polygon::new(
+                    vec![
+                        (x, y - triangle_height),
+                        (x - triangle_half_width, y + triangle_height),
+                        (x + triangle_half_width, y + triangle_height),
+                    ],
+                    color.filled(),
+                )))?;
             } else {
-                // Upward-pointing triangle (▲) below candle, pointing at the low
-                chart_context
-                    .draw_series(std::iter::once(Polygon::new(
-                        vec![
-                            (x, y + triangle_height),           // Top point (pointing up)
-                            (x - triangle_half_width, y - triangle_height), // Bottom left
-                            (x + triangle_half_width, y - triangle_height), // Bottom right
-                        ],
-                        color.filled(),
-                    )))
-                    .unwrap();
+                chart_context.draw_series(std::iter::once(Polygon::new(
+                    vec![
+                        (x, y + triangle_height),
+                        (x - triangle_half_width, y - triangle_height),
+                        (x + triangle_half_width, y - triangle_height),
+                    ],
+                    color.filled(),
+                )))?;
             }
 
             // Draw label text if provided
@@ -960,58 +990,54 @@ fn handle_chart_request(data: ChartData, output_dir: &str) {
                     y - offset * 1.2
                 };
                 let font_size = (12.0 * size).max(8.0) as i32;
-                chart_context
-                    .draw_series(std::iter::once(Text::new(
-                        text.clone(),
-                        (x, text_y),
-                        TextStyle::from(("sans-serif", font_size)).color(&color),
-                    )))
-                    .unwrap();
+                chart_context.draw_series(std::iter::once(Text::new(
+                    text.clone(),
+                    (x, text_y),
+                    TextStyle::from(("sans-serif", font_size)).color(&color),
+                )))?;
             }
         }
     }
 
-// Instead of drawing custom labels, use the built-in x-axis labels with rotation
-// We're now using simpler numerical hours as the x-axis values, which won't cause overflow
-
     // Present and save the result
-    root_area.present().unwrap();
+    root_area.present()?;
 
-    println!(
-        "{} {} {}",
-        format!("[{}]", now).dimmed(),
-        "✅".green().bold(),
-        format!("Chart processing complete. Saved to: {}", file_path.bold())
+    info!(
+        "[{}] Chart processing complete. Saved to: {}",
+        now, file_path
     );
-    
-    // Send notification to telegram service via ZMQ
-    if let Err(e) = send_telegram_notification(&data, &file_path) {
-        eprintln!("[{}] ❌ Failed to send telegram notification: {}", now, e);
+
+    // Phase 4B: Send notification using shared ZMQ context
+    if let Err(e) = send_telegram_notification(zmq_ctx, data, &file_path) {
+        error!("[{}] Failed to send telegram notification: {}", now, e);
     } else {
-        // Log where the notification was sent
         let destination = match (&data.chat_id, &data.subscriber_list) {
             (Some(chat_id), _) => format!("chat_id: {}", chat_id),
             (_, Some(list)) => format!("subscriber_list: {}", list),
-            _ => "default destination".to_string()
+            _ => "default destination".to_string(),
         };
-        println!(
-            "{} {} {}",
-            format!("[{}]", now).dimmed(),
-            "📲".blue().bold(),
-            format!("Telegram notification sent to {}", destination.bold())
+        info!(
+            "[{}] Telegram notification sent to {}",
+            now, destination
         );
     }
+
+    Ok(())
 }
 
 /// Send a notification to the telegram service via ZMQ with the chart details and image path
-fn send_telegram_notification(data: &ChartData, image_path: &str) -> Result<(), Box<dyn Error>> {
-    let context = zmq::Context::new();
-    let socket = context.socket(zmq::DEALER)?;
-    
+/// Phase 4B: Accepts shared zmq::Context instead of creating a new one each call
+fn send_telegram_notification(
+    zmq_ctx: &zmq::Context,
+    data: &ChartData,
+    image_path: &str,
+) -> Result<(), Box<dyn Error>> {
+    let socket = zmq_ctx.socket(zmq::DEALER)?;
+
     // Connect to the same endpoint as the main application
     let endpoint = "tcp://127.0.0.1:6565";
     socket.connect(endpoint)?;
-    
+
     // Create the payload with chat_id and subscriber_list if available
     let payload = serde_json::json!([
         "ok",
@@ -1023,35 +1049,12 @@ fn send_telegram_notification(data: &ChartData, image_path: &str) -> Result<(), 
             "subscriber_list": data.subscriber_list
         }
     ]);
-    
+
     // Convert to string
     let json_message = payload.to_string();
-    
+
     // Send the multipart message
-    socket.send_multipart(&[b"telegram", json_message.as_bytes()], 0)?;
-    
+    socket.send_multipart([b"telegram", json_message.as_bytes()], 0)?;
+
     Ok(())
-}
-
-/// A small helper extension for converting a string hex code into a `ShapeStyle`.
-/// This is not in the standard plotters library, so we do a quick parse:
-pub trait PaletteColor {
-    fn pick_from_hex<S: AsRef<str>>(hex_str: S) -> Self;
-}
-
-impl PaletteColor for ShapeStyle {
-    fn pick_from_hex<S: AsRef<str>>(hex_str: S) -> Self {
-        let txt = hex_str.as_ref().trim_start_matches('#');
-        if txt.len() == 6 {
-            if let Ok(rgb) = u32::from_str_radix(txt, 16) {
-                let r = ((rgb >> 16) & 0xFF) as u8;
-                let g = ((rgb >> 8) & 0xFF) as u8;
-                let b = (rgb & 0xFF) as u8;
-                let color = RGBColor(r, g, b);
-                return ShapeStyle::from(&color);
-            }
-        }
-        // Fallback: black
-        ShapeStyle::from(&BLACK)
-    }
 }
