@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local, LocalResult, TimeZone, Utc};
-use log::{debug, error, info, warn};
+use log::{debug, error, info, warn, Level, LevelFilter, Metadata, Record};
 use serde::Deserialize;
 use serde_json::from_str;
 use std::panic::AssertUnwindSafe;
@@ -203,12 +203,87 @@ fn sanitize_path_component(s: &str) -> String {
 static ACTIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
 const MAX_CONCURRENT_CHARTS: usize = 4;
 
+// ─── Logger ─────────────────────────────────────────────────────────────────
+
+fn setup_logger() {
+    struct CorkyLogger {
+        max_level: LevelFilter,
+    }
+
+    impl log::Log for CorkyLogger {
+        fn enabled(&self, metadata: &Metadata) -> bool {
+            metadata.level() <= self.max_level
+        }
+
+        fn log(&self, record: &Record) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs() % 86400;
+            let h = secs / 3600;
+            let m = (secs % 3600) / 60;
+            let s = secs % 60;
+            let timestamp = format!("{:02}:{:02}:{:02}", h, m, s);
+
+            let msg = record.args().to_string();
+
+            const RESET: &str = "\x1b[0m";
+            const GRAY: &str = "\x1b[90m";
+            const RED: &str = "\x1b[31m";
+            const YELLOW: &str = "\x1b[33m";
+            const CYAN: &str = "\x1b[36m";
+            const GREEN: &str = "\x1b[32m";
+            const MAGENTA: &str = "\x1b[35m";
+
+            let (color, prefix) = match record.level() {
+                Level::Error => (RED, "ERROR"),
+                Level::Warn => (YELLOW, "WARN "),
+                Level::Info => {
+                    if msg.contains("[INIT]") || msg.contains("[READY]") {
+                        (GREEN, "INIT ")
+                    } else if msg.contains("Chart Request") || msg.contains("[CHART]") {
+                        (CYAN, "CHART")
+                    } else if msg.contains("notification") || msg.contains("telegram") {
+                        (MAGENTA, "NOTIF")
+                    } else {
+                        (GRAY, "INFO ")
+                    }
+                }
+                Level::Debug => (GRAY, "DEBUG"),
+                Level::Trace => (GRAY, "TRACE"),
+            };
+
+            println!("{}{} [{}] {}{}", color, timestamp, prefix, msg, RESET);
+        }
+
+        fn flush(&self) {}
+    }
+
+    let level = match std::env::var("RUST_LOG")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "trace" => LevelFilter::Trace,
+        "debug" => LevelFilter::Debug,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        _ => LevelFilter::Info,
+    };
+
+    let _ = log::set_boxed_logger(Box::new(CorkyLogger { max_level: level }))
+        .map(|()| log::set_max_level(level));
+}
+
 // ─── Main Logic ─────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Phase 6: Initialize structured logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .init();
+    setup_logger();
 
     // Get the output directory from config file
     let output_dir = get_output_directory()?;
