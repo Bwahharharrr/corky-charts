@@ -125,6 +125,18 @@ pub struct ChartData {
     /// Optional unique image filename to prevent race condition overwrites
     #[serde(default)]
     pub image_filename: Option<String>,
+    /// Telegram album batching: shared id across photos that should arrive
+    /// in a single sendMediaGroup call. Forwarded verbatim to corky-telegram.
+    /// Default None preserves legacy single-photo behaviour.
+    #[serde(default)]
+    pub media_group_id: Option<String>,
+    /// Expected total photos in the album (e.g. 2 for primary+wide).
+    #[serde(default)]
+    pub media_group_size: Option<u32>,
+    /// 0-indexed position within the album. The photo at index 0 carries the
+    /// caption; other indices have empty captions per Telegram convention.
+    #[serde(default)]
+    pub media_group_index: Option<u32>,
 }
 
 /// Marker to be drawn on the chart (e.g., signal indicators)
@@ -1113,17 +1125,25 @@ fn send_telegram_notification(
     let endpoint = "tcp://127.0.0.1:6565";
     socket.connect(endpoint)?;
 
-    // Create the payload with chat_id and subscriber_list if available
-    let payload = serde_json::json!([
-        "ok",
-        "send_message",
-        {
-            "text": data.desc,
-            "image_path": image_path,
-            "chat_id": data.chat_id,
-            "subscriber_list": data.subscriber_list
-        }
-    ]);
+    // Build inner message; album fields are added conditionally so legacy
+    // payload shape is preserved when not in an album.
+    let mut msg = serde_json::json!({
+        "text": data.desc,
+        "image_path": image_path,
+        "chat_id": data.chat_id,
+        "subscriber_list": data.subscriber_list,
+    });
+    if let Some(ref gid) = data.media_group_id {
+        msg["media_group_id"] = serde_json::Value::String(gid.clone());
+    }
+    if let Some(gs) = data.media_group_size {
+        msg["media_group_size"] = serde_json::Value::Number(serde_json::Number::from(gs));
+    }
+    if let Some(gi) = data.media_group_index {
+        msg["media_group_index"] = serde_json::Value::Number(serde_json::Number::from(gi));
+    }
+
+    let payload = serde_json::json!(["ok", "send_message", msg]);
 
     // Convert to string
     let json_message = payload.to_string();
@@ -1132,4 +1152,59 @@ fn send_telegram_notification(
     socket.send_multipart([b"telegram", json_message.as_bytes()], 0)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_chart_data_json(extra_fields: &str) -> String {
+        // Smallest valid ChartData JSON with empty plots/data; extra_fields is
+        // a comma-prefixed snippet to append before the closing brace.
+        format!(
+            r#"{{
+                "title": "T",
+                "ticker": "X",
+                "timeframe": "1D",
+                "cols": ["timestamp","open","high","low","close","volume"],
+                "data": [],
+                "candle_colors": [],
+                "plots": {{"marks": [], "zones": [], "vlines": []}},
+                "desc": "d"{extra}
+            }}"#,
+            extra = extra_fields
+        )
+    }
+
+    #[test]
+    fn chart_data_roundtrip_with_media_group_fields() {
+        let json = minimal_chart_data_json(
+            r#", "media_group_id": "g-abc", "media_group_size": 2, "media_group_index": 0"#,
+        );
+        let cd: ChartData = serde_json::from_str(&json).expect("deserialize must succeed");
+        assert_eq!(cd.media_group_id.as_deref(), Some("g-abc"));
+        assert_eq!(cd.media_group_size, Some(2));
+        assert_eq!(cd.media_group_index, Some(0));
+    }
+
+    #[test]
+    fn chart_data_roundtrip_without_media_group_fields() {
+        let json = minimal_chart_data_json("");
+        let cd: ChartData = serde_json::from_str(&json).expect("deserialize must succeed");
+        assert!(cd.media_group_id.is_none());
+        assert!(cd.media_group_size.is_none());
+        assert!(cd.media_group_index.is_none());
+    }
+
+    #[test]
+    fn chart_data_partial_media_group_fields() {
+        // Only media_group_id present; the other two Option<…> fields default
+        // to None thanks to #[serde(default)] — proves the partial case
+        // deserializes cleanly rather than rejecting the payload.
+        let json = minimal_chart_data_json(r#", "media_group_id": "g-partial""#);
+        let cd: ChartData = serde_json::from_str(&json).expect("deserialize must succeed");
+        assert_eq!(cd.media_group_id.as_deref(), Some("g-partial"));
+        assert!(cd.media_group_size.is_none());
+        assert!(cd.media_group_index.is_none());
+    }
 }
