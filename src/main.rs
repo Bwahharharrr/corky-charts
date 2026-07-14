@@ -1207,4 +1207,37 @@ mod tests {
         assert!(cd.media_group_size.is_none());
         assert!(cd.media_group_index.is_none());
     }
+
+    #[test]
+    fn p7_strategy_lifecycle_overlay_golden_payload() {
+        let json = r##"{
+            "title": "ema_regime_breakout_v8 lifecycle",
+            "ticker": "tTESTADA:TESTUSD",
+            "timeframe": "1m",
+            "cols": ["timestamp","open","high","low","close","volume"],
+            "data": [[1784073500000,100,102,99,101,10],[1784073600000,101,103,100,102,11]],
+            "candle_colors": ["#00AA00","#00AA00"],
+            "plots": {
+                "marks": [
+                    {"time":1784073500000,"position":"below","color":"#00AA00","text":"enabled","size":1.0},
+                    {"time":1784073600000,"position":"above","color":"#FF8800","text":"degraded","size":1.0}
+                ],
+                "zones": [
+                    {"x1":1784073500000,"x2":1784073600000,"y1":99.0,"y2":103.0,"color":"#00AA0020"}
+                ],
+                "vlines": [
+                    {"time":1784073500000,"color":"#00AA00"},
+                    {"time":1784073600000,"color":"#FF8800"}
+                ]
+            },
+            "desc": "P7 start/enable/degrade/recover intervals"
+        }"##;
+        let chart: ChartData =
+            serde_json::from_str(json).expect("P7 lifecycle chart payload must remain compatible");
+        assert_eq!(chart.plots.marks.len(), 2);
+        assert_eq!(chart.plots.zones.len(), 1);
+        assert_eq!(chart.plots.vlines.len(), 2);
+        assert_eq!(chart.plots.marks[0].text.as_deref(), Some("enabled"));
+        assert_eq!(chart.plots.marks[1].text.as_deref(), Some("degraded"));
+    }
 }
